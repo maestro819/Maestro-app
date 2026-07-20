@@ -1,0 +1,996 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1" />
+<title>MAESTRO</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@500;600;700;800&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js" crossorigin></script>
+<script src="https://unpkg.com/xlsx@0.18.5/dist/xlsx.full.min.js" crossorigin></script>
+<style>
+  body { margin: 0; font-family: 'Inter', sans-serif; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel">
+const { useState, useEffect, useMemo, useCallback, useRef } = React;
+
+
+const STORAGE_KEY = "maestro:data-v1";
+const BULAN = ["Jan", "Feb", "Mar", "Apr", "Mei", "Jun", "Jul", "Agu", "Sep", "Okt", "Nov", "Des"];
+const BULAN_FULL = ["Januari","Februari","Maret","April","Mei","Juni","Juli","Agustus","September","Oktober","November","Desember"];
+
+
+function uid(p) { return `${p}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`; }
+function formatRupiah(n) {
+  const v = Math.round(n || 0);
+  return (v < 0 ? "-Rp " : "Rp ") + Math.abs(v).toLocaleString("id-ID");
+}
+function todayISO() { return new Date().toISOString().slice(0, 10); }
+function formatDateID(iso) {
+  if (!iso) return "-";
+  return new Date(iso).toLocaleDateString("id-ID", { day: "2-digit", month: "short", year: "numeric" });
+}
+function payKey(memberId, year, month) { return `${memberId}:${year}-${month}`; }
+
+const defaultGroup = (name, amount) => ({
+  name, defaultAmount: amount, openingBalance: 0, members: [], payments: {}, expenses: [],
+});
+
+const emptyData = {
+  appName: "MAESTRO",
+  appTagline: "easy does it",
+  auth: { username: "admin", password: "admin123" },
+  groups: { A: defaultGroup("Group A", 50000), B: defaultGroup("Group B", 100000) },
+  activityLog: [],
+};
+
+const STATUS_STYLE = {
+  paid: { label: "Paid", bg: "#DCFCE7", fg: "#15803D" },
+  unpaid: { label: "Unpaid", bg: "#FEE2E2", fg: "#B91C1C" },
+  leave: { label: "Leave", bg: "#FEF3C7", fg: "#B45309" },
+};
+
+function Maestro() {
+  const [data, setData] = useState(emptyData);
+  const [loaded, setLoaded] = useState(false);
+  const [saveError, setSaveError] = useState(false);
+
+  const [isLoggedIn, setIsLoggedIn] = useState(false);
+  const [loginUser, setLoginUser] = useState("");
+  const [loginPass, setLoginPass] = useState("");
+  const [loginError, setLoginError] = useState("");
+
+  const [selectedGroup, setSelectedGroup] = useState("A");
+  const [selectedMonth, setSelectedMonth] = useState(new Date().getMonth());
+  const [selectedYear, setSelectedYear] = useState(new Date().getFullYear());
+  const [tab, setTab] = useState("dashboard");
+  const [screenshotMode, setScreenshotMode] = useState(false);
+
+  const [memberModal, setMemberModal] = useState(null); // memberId
+  const [customAmount, setCustomAmount] = useState("");
+  const [useCustom, setUseCustom] = useState(false);
+
+  const [newMemberName, setNewMemberName] = useState("");
+  const [expDate, setExpDate] = useState(todayISO());
+  const [expDesc, setExpDesc] = useState("");
+  const [expAmount, setExpAmount] = useState("");
+
+  const canvasHost = useRef(null);
+  const restoreInputRef = useRef(null);
+  const [reportView, setReportView] = useState("monthly");
+  const [restoreMsg, setRestoreMsg] = useState("");
+  const [exportLinks, setExportLinks] = useState([]);
+
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (raw) setData({ ...emptyData, ...JSON.parse(raw) });
+    } catch (e) { /* first run or corrupted data */ }
+    finally { setLoaded(true); }
+  }, []);
+
+  useEffect(() => {
+    if (!loaded) return;
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+      setSaveError(false);
+    } catch (e) { setSaveError(true); }
+  }, [data, loaded]);
+
+  const logActivity = useCallback((text) => {
+    setData((d) => ({
+      ...d,
+      activityLog: [{ id: uid("log"), date: new Date().toISOString(), group: selectedGroup, text }, ...d.activityLog].slice(0, 300),
+    }));
+  }, [selectedGroup]);
+
+  const group = data.groups[selectedGroup];
+
+  const handleLogin = () => {
+    if (loginUser === data.auth.username && loginPass === data.auth.password) {
+      setIsLoggedIn(true);
+      setLoginError("");
+    } else {
+      setLoginError("Username atau password salah.");
+    }
+  };
+
+  // ---- Derived data for selected group/month/year ----
+  const memberRows = useMemo(() => {
+    return group.members.map((m) => {
+      const p = group.payments[payKey(m.id, selectedYear, selectedMonth)];
+      return {
+        ...m,
+        status: p ? p.status : "unpaid",
+        amount: p && p.status === "paid" ? p.amount : null,
+        paymentDate: p && p.status === "paid" ? p.paymentDate : null,
+      };
+    });
+  }, [group, selectedYear, selectedMonth]);
+
+  const paidCount = memberRows.filter((m) => m.status === "paid").length;
+  const leaveCount = memberRows.filter((m) => m.status === "leave").length;
+  const unpaidCount = memberRows.length - paidCount - leaveCount;
+
+  const monthlyIncome = memberRows.filter((m) => m.status === "paid").reduce((s, m) => s + (m.amount || 0), 0);
+  const monthlyExpenses = useMemo(
+    () => group.expenses.filter((e) => e.date.slice(0, 7) === `${selectedYear}-${String(selectedMonth + 1).padStart(2, "0")}`).reduce((s, e) => s + e.amount, 0),
+    [group, selectedYear, selectedMonth]
+  );
+
+  const allTimeIncome = useMemo(
+    () => Object.values(group.payments).filter((p) => p.status === "paid").reduce((s, p) => s + p.amount, 0),
+    [group]
+  );
+  const allTimeExpenses = useMemo(() => group.expenses.reduce((s, e) => s + e.amount, 0), [group]);
+  const cashBalance = group.openingBalance + allTimeIncome - allTimeExpenses;
+
+  // ---- Member actions ----
+  const updateGroup = (patch) => {
+    setData((d) => ({ ...d, groups: { ...d.groups, [selectedGroup]: { ...d.groups[selectedGroup], ...patch(d.groups[selectedGroup]) } } }));
+  };
+
+  const addMember = () => {
+    if (!newMemberName.trim()) return;
+    const m = { id: uid("m"), nama: newMemberName.trim() };
+    updateGroup((g) => ({ members: [...g.members, m] }));
+    logActivity(`${m.nama} ditambahkan ke ${group.name}`);
+    setNewMemberName("");
+  };
+
+  const removeMember = (id, nama) => {
+    updateGroup((g) => {
+      const payments = { ...g.payments };
+      Object.keys(payments).forEach((k) => { if (k.startsWith(`${id}:`)) delete payments[k]; });
+      return { members: g.members.filter((m) => m.id !== id), payments };
+    });
+    logActivity(`${nama} dihapus dari ${group.name}`);
+  };
+
+  const markPaid = (memberId, nama, amount) => {
+    updateGroup((g) => ({
+      payments: { ...g.payments, [payKey(memberId, selectedYear, selectedMonth)]: { status: "paid", amount, paymentDate: todayISO() } },
+    }));
+    logActivity(`${nama} bayar ${formatRupiah(amount)} (${BULAN_FULL[selectedMonth]} ${selectedYear})`);
+    setMemberModal(null); setUseCustom(false); setCustomAmount("");
+  };
+
+  const markLeave = (memberId, nama) => {
+    updateGroup((g) => ({ payments: { ...g.payments, [payKey(memberId, selectedYear, selectedMonth)]: { status: "leave" } } }));
+    logActivity(`${nama} ditandai Libur (${BULAN_FULL[selectedMonth]} ${selectedYear})`);
+    setMemberModal(null);
+  };
+
+  const markUnpaid = (memberId, nama) => {
+    updateGroup((g) => {
+      const payments = { ...g.payments };
+      delete payments[payKey(memberId, selectedYear, selectedMonth)];
+      return { payments };
+    });
+    logActivity(`${nama} ditandai Unpaid (${BULAN_FULL[selectedMonth]} ${selectedYear})`);
+    setMemberModal(null);
+  };
+
+  // ---- Expenses ----
+  const addExpense = () => {
+    const nom = parseFloat(String(expAmount).replace(/[^0-9.-]/g, ""));
+    if (!expDesc.trim() || !nom || nom <= 0) return;
+    updateGroup((g) => ({ expenses: [{ id: uid("e"), date: expDate, description: expDesc.trim(), amount: nom }, ...g.expenses] }));
+    logActivity(`Pengeluaran: ${expDesc.trim()} ${formatRupiah(nom)} (${group.name})`);
+    setExpDesc(""); setExpAmount("");
+  };
+  const removeExpense = (id, desc) => {
+    updateGroup((g) => ({ expenses: g.expenses.filter((e) => e.id !== id) }));
+    logActivity(`Pengeluaran dihapus: ${desc}`);
+  };
+
+  // ---- Cash book ----
+  const cashBookRows = useMemo(() => {
+    const incomeRows = Object.entries(group.payments)
+      .filter(([, p]) => p.status === "paid")
+      .map(([key, p]) => {
+        const [memberId, ym] = key.split(":");
+        const [yr, mo] = ym.split("-").map(Number);
+        const m = group.members.find((mm) => mm.id === memberId);
+        return { date: p.paymentDate, desc: `Iuran ${m ? m.nama : "?"} (${BULAN[mo]} ${yr})`, income: p.amount, expense: 0 };
+      });
+    const expenseRows = group.expenses.map((e) => ({ date: e.date, desc: e.description, income: 0, expense: e.amount }));
+    const rows = [...incomeRows, ...expenseRows].sort((a, b) => new Date(a.date) - new Date(b.date));
+    let running = group.openingBalance;
+    return rows.map((r) => { running += r.income - r.expense; return { ...r, balance: running }; });
+  }, [group]);
+
+  const yearlyBreakdown = useMemo(() => {
+    return BULAN.map((label, month) => {
+      let income = 0;
+      group.members.forEach((m) => {
+        const p = group.payments[payKey(m.id, selectedYear, month)];
+        if (p && p.status === "paid") income += p.amount;
+      });
+      const expense = group.expenses
+        .filter((e) => e.date.slice(0, 7) === `${selectedYear}-${String(month + 1).padStart(2, "0")}`)
+        .reduce((s, e) => s + e.amount, 0);
+      return { label, income, expense, net: income - expense };
+    });
+  }, [group, selectedYear]);
+
+  const groupComparison = useMemo(() => {
+    return ["A", "B"].map((gk) => {
+      const g = data.groups[gk];
+      const income = Object.values(g.payments).filter((p) => p.status === "paid").reduce((s, p) => s + p.amount, 0);
+      const expense = g.expenses.reduce((s, e) => s + e.amount, 0);
+      return { key: gk, name: g.name, members: g.members.length, income, expense, balance: g.openingBalance + income - expense };
+    });
+  }, [data.groups]);
+
+  // ---- Excel export (single compact sheet) ----
+  const handleExportExcel = () => {
+    const years = Array.from(new Set(Object.keys(group.payments).map((k) => Number(k.split(":")[1].split("-")[0]))));
+    const yr = years.includes(selectedYear) ? selectedYear : (years[0] || selectedYear);
+    const header = ["No", "Nama", ...BULAN];
+    const rows = group.members.map((m, i) => {
+      const row = [i + 1, m.nama];
+      BULAN.forEach((_, month) => {
+        const p = group.payments[payKey(m.id, yr, month)];
+        if (p && p.status === "paid") row.push(p.amount);
+        else if (p && p.status === "leave") row.push("Libur");
+        else row.push("");
+      });
+      return row;
+    });
+    const totalsRow = ["", "Total"];
+    let grandIncome = 0;
+    BULAN.forEach((_, month) => {
+      let t = 0;
+      group.members.forEach((m) => {
+        const p = group.payments[payKey(m.id, yr, month)];
+        if (p && p.status === "paid") t += p.amount;
+      });
+      grandIncome += t;
+      totalsRow.push(t);
+    });
+    const aoa = [
+      [`${data.appName} — ${data.appTagline}`],
+      [`${group.name} — Tahun ${yr}`],
+      [],
+      header,
+      ...rows,
+      totalsRow,
+      [],
+      ["", "Grand Total Pemasukan", grandIncome],
+      ["", "Total Pengeluaran", allTimeExpenses],
+      ["", "Saldo Akhir", cashBalance],
+      [],
+      [`Dibuat: ${new Date().toLocaleString("id-ID")}`],
+    ];
+    const ws = XLSX.utils.aoa_to_sheet(aoa);
+    ws["!cols"] = [{ wch: 4 }, { wch: 18 }, ...BULAN.map(() => ({ wch: 8 }))];
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, group.name.slice(0, 28));
+    const wbout = XLSX.write(wb, { bookType: "xlsx", type: "array" });
+    const blob = new Blob([wbout], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+    const url = URL.createObjectURL(blob);
+    setExportLinks((prev) => [
+      { id: uid("xls"), kind: "excel", filename: `maestro-${selectedGroup}-${yr}.xlsx`, url },
+      ...prev,
+    ]);
+    logActivity(`Excel ${group.name} tahun ${yr} dibuat`);
+  };
+
+  // ---- Backup / Restore ----
+  const handleBackup = () => {
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    setExportLinks((prev) => [{ id: uid("bak"), kind: "backup", filename: `maestro-backup-${todayISO()}.json`, url }, ...prev]);
+    logActivity("Backup data dibuat");
+  };
+
+  const handleRestoreFile = (file) => {
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const parsed = JSON.parse(e.target.result);
+        if (!parsed.groups || !parsed.auth) throw new Error("format tidak valid");
+        setData({ ...emptyData, ...parsed });
+        setRestoreMsg("Data berhasil dipulihkan.");
+        logActivity("Data dipulihkan dari file backup");
+      } catch (err) {
+        setRestoreMsg("Gagal memulihkan: file tidak valid.");
+      }
+    };
+    reader.readAsText(file);
+  };
+
+  // ---- PNG export via canvas (paginated) ----
+  const handleDownloadPNG = () => {
+    const ROWS_PER_PAGE = 22;
+    const pages = Math.max(1, Math.ceil(memberRows.length / ROWS_PER_PAGE));
+    for (let p = 0; p < pages; p++) {
+      const pageMembers = memberRows.slice(p * ROWS_PER_PAGE, (p + 1) * ROWS_PER_PAGE);
+      drawReportPage(pageMembers, p + 1, pages);
+    }
+    logActivity(`PNG ${group.name} dibuat (${pages} halaman)`);
+  };
+
+  function drawReportPage(pageMembers, pageNum, totalPages) {
+    const W = 720;
+    const rowH = 30;
+    const topH = 300;
+    const bottomH = 140;
+    const H = topH + pageMembers.length * rowH + bottomH;
+    const canvas = document.createElement("canvas");
+    canvas.width = W; canvas.height = H;
+    const ctx = canvas.getContext("2d");
+
+    ctx.fillStyle = "#F8FAFC"; ctx.fillRect(0, 0, W, H);
+
+    // Header band
+    const grad = ctx.createLinearGradient(0, 0, W, 0);
+    grad.addColorStop(0, "#6366F1"); grad.addColorStop(1, "#8B5CF6");
+    ctx.fillStyle = grad; ctx.fillRect(0, 0, W, 86);
+    ctx.fillStyle = "#FFFFFF";
+    ctx.font = "700 26px 'Plus Jakarta Sans', sans-serif";
+    ctx.fillText(data.appName, 24, 40);
+    ctx.font = "500 13px Inter, sans-serif";
+    ctx.fillStyle = "rgba(255,255,255,0.85)";
+    ctx.fillText(data.appTagline, 24, 62);
+    ctx.textAlign = "right";
+    ctx.font = "600 15px Inter, sans-serif";
+    ctx.fillText(`${group.name}`, W - 24, 38);
+    ctx.font = "400 13px Inter, sans-serif";
+    ctx.fillText(`${BULAN_FULL[selectedMonth]} ${selectedYear}`, W - 24, 58);
+    ctx.textAlign = "left";
+
+    // Summary cards
+    const cards = [
+      ["Saldo Kas", formatRupiah(cashBalance), "#4F46E5"],
+      ["Pemasukan", formatRupiah(monthlyIncome), "#16A34A"],
+      ["Pengeluaran", formatRupiah(monthlyExpenses), "#DC2626"],
+      ["Paid", String(paidCount), "#16A34A"],
+      ["Unpaid", String(unpaidCount), "#DC2626"],
+      ["Leave", String(leaveCount), "#D97706"],
+    ];
+    const cw = (W - 24 * 2 - 8 * 2) / 3;
+    cards.forEach((c, i) => {
+      const col = i % 3, row = Math.floor(i / 3);
+      const x = 24 + col * (cw + 8), y = 100 + row * 62;
+      ctx.fillStyle = "#FFFFFF";
+      roundRect(ctx, x, y, cw, 54, 10); ctx.fill();
+      ctx.fillStyle = "#94A3B8"; ctx.font = "600 10px Inter, sans-serif";
+      ctx.fillText(c[0].toUpperCase(), x + 10, y + 18);
+      ctx.fillStyle = c[2]; ctx.font = "700 16px 'Plus Jakarta Sans', sans-serif";
+      ctx.fillText(c[1], x + 10, y + 40);
+    });
+
+    // Table header
+    let y = 240;
+    ctx.fillStyle = "#1E293B"; ctx.font = "700 12px Inter, sans-serif";
+    ctx.fillText("No", 24, y);
+    ctx.fillText("Nama", 54, y);
+    ctx.fillText("Status", 340, y);
+    ctx.fillText("Nominal", 440, y);
+    ctx.fillText("Tanggal", 580, y);
+    y += 10;
+    ctx.strokeStyle = "#E2E8F0"; ctx.beginPath(); ctx.moveTo(24, y); ctx.lineTo(W - 24, y); ctx.stroke();
+
+    pageMembers.forEach((m, idx) => {
+      const ry = y + 22 + idx * rowH;
+      ctx.fillStyle = "#334155"; ctx.font = "500 12px Inter, sans-serif";
+      ctx.fillText(String((memberRows.indexOf(m)) + 1), 24, ry);
+      ctx.fillText(m.nama.length > 26 ? m.nama.slice(0, 25) + "…" : m.nama, 54, ry);
+      const st = STATUS_STYLE[m.status];
+      ctx.fillStyle = st.bg; roundRect(ctx, 335, ry - 14, 74, 20, 6); ctx.fill();
+      ctx.fillStyle = st.fg; ctx.font = "600 10px Inter, sans-serif";
+      ctx.fillText(st.label, 348, ry);
+      ctx.fillStyle = "#1E293B"; ctx.font = "500 12px Inter, sans-serif";
+      ctx.fillText(m.status === "paid" ? formatRupiah(m.amount) : "-", 440, ry);
+      ctx.fillText(m.status === "paid" ? formatDateID(m.paymentDate) : "-", 580, ry);
+      ctx.strokeStyle = "#F1F5F9"; ctx.beginPath(); ctx.moveTo(24, ry + 8); ctx.lineTo(W - 24, ry + 8); ctx.stroke();
+    });
+
+    // Footer totals
+    let fy = topH + pageMembers.length * rowH + 20;
+    ctx.strokeStyle = "#CBD5E1"; ctx.beginPath(); ctx.moveTo(24, fy - 14); ctx.lineTo(W - 24, fy - 14); ctx.stroke();
+    ctx.font = "600 12px Inter, sans-serif"; ctx.fillStyle = "#334155";
+    ctx.fillText(`Pemasukan Bulan Ini: ${formatRupiah(monthlyIncome)}`, 24, fy); fy += 20;
+    ctx.fillText(`Pengeluaran Bulan Ini: ${formatRupiah(monthlyExpenses)}`, 24, fy); fy += 20;
+    ctx.font = "700 13px 'Plus Jakarta Sans', sans-serif"; ctx.fillStyle = "#4F46E5";
+    ctx.fillText(`Saldo Akhir: ${formatRupiah(cashBalance)}`, 24, fy); fy += 22;
+    ctx.font = "400 10px Inter, sans-serif"; ctx.fillStyle = "#94A3B8";
+    ctx.fillText(`Dibuat ${new Date().toLocaleString("id-ID")} — Hal ${pageNum}/${totalPages}`, 24, fy);
+
+    const filename = `maestro-${selectedGroup}-${selectedYear}-${selectedMonth + 1}-hal${pageNum}.png`;
+    const dataUrl = canvas.toDataURL("image/png");
+    setExportLinks((prev) => [{ id: uid("png"), kind: "png", filename, url: dataUrl, page: pageNum, totalPages }, ...prev]);
+  }
+
+  function roundRect(ctx, x, y, w, h, r) {
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+  }
+
+  // ================= RENDER =================
+
+  if (!isLoggedIn) {
+    return (
+      <div
+        className="min-h-screen flex items-center justify-center px-5"
+        style={{ background: "linear-gradient(135deg,#6366F1,#8B5CF6 50%,#EC4899)", fontFamily: "'Inter',sans-serif" }}
+      >
+        <div className="bg-white rounded-2xl shadow-2xl p-7 w-full max-w-sm">
+          <h1 className="text-3xl font-extrabold text-center mb-0.5" style={{ fontFamily: "'Plus Jakarta Sans',sans-serif", color: "#312E81" }}>
+            {data.appName}
+          </h1>
+          <p className="text-center text-xs italic mb-6" style={{ color: "#94A3B8" }}>{data.appTagline}</p>
+          <div className="flex items-center gap-2 border rounded-xl px-3 py-2.5 mb-3" style={{ borderColor: "#E2E8F0" }}>
+            👤
+            <input value={loginUser} onChange={(e) => setLoginUser(e.target.value)} placeholder="Username"
+              className="flex-1 outline-none text-sm" onKeyDown={(e) => e.key === "Enter" && handleLogin()} />
+          </div>
+          <div className="flex items-center gap-2 border rounded-xl px-3 py-2.5 mb-2" style={{ borderColor: "#E2E8F0" }}>
+            🔒
+            <input type="password" value={loginPass} onChange={(e) => setLoginPass(e.target.value)} placeholder="Password"
+              className="flex-1 outline-none text-sm" onKeyDown={(e) => e.key === "Enter" && handleLogin()} />
+          </div>
+          {loginError && <p className="text-xs mb-3" style={{ color: "#DC2626" }}>{loginError}</p>}
+          <button onClick={handleLogin} className="w-full py-3 rounded-xl text-white font-semibold text-sm mt-2"
+            style={{ background: "linear-gradient(135deg,#6366F1,#8B5CF6)" }}>
+            Masuk
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  const modalMember = memberModal ? group.members.find((m) => m.id === memberModal) : null;
+
+  // ---------- SCREENSHOT MODE ----------
+  if (screenshotMode) {
+    return (
+      <div className="min-h-screen" style={{ background: "#F8FAFC", fontFamily: "'Inter',sans-serif" }}>
+        <button onClick={() => setScreenshotMode(false)}
+          className="fixed top-3 right-3 z-50 bg-white shadow-md rounded-full p-2">
+          ✕
+        </button>
+        <div className="max-w-md mx-auto px-4 py-6">
+          <div className="rounded-2xl p-5 mb-4 text-white" style={{ background: "linear-gradient(135deg,#6366F1,#8B5CF6)" }}>
+            <h1 className="text-2xl font-extrabold" style={{ fontFamily: "'Plus Jakarta Sans',sans-serif" }}>{data.appName}</h1>
+            <p className="text-xs italic opacity-80 mb-2">{data.appTagline}</p>
+            <p className="text-sm font-semibold">{group.name} — {BULAN_FULL[selectedMonth]} {selectedYear}</p>
+          </div>
+
+          <div className="grid grid-cols-3 gap-2 mb-4">
+            <SummaryCard label="Saldo" value={formatRupiah(cashBalance)} color="#4F46E5" />
+            <SummaryCard label="Masuk" value={formatRupiah(monthlyIncome)} color="#16A34A" />
+            <SummaryCard label="Keluar" value={formatRupiah(monthlyExpenses)} color="#DC2626" />
+          </div>
+          <div className="grid grid-cols-3 gap-2 mb-5">
+            <SummaryCard label="Paid" value={paidCount} color="#16A34A" />
+            <SummaryCard label="Unpaid" value={unpaidCount} color="#DC2626" />
+            <SummaryCard label="Leave" value={leaveCount} color="#D97706" />
+          </div>
+
+          <div className="bg-white rounded-xl shadow-sm p-3 mb-4">
+            <p className="text-xs font-semibold mb-2" style={{ color: "#94A3B8" }}>DAFTAR ANGGOTA</p>
+            {memberRows.map((m, i) => (
+              <MemberLine key={m.id} idx={i + 1} m={m} />
+            ))}
+          </div>
+
+          <div className="bg-white rounded-xl shadow-sm p-3 mb-4">
+            <p className="text-xs font-semibold mb-2" style={{ color: "#94A3B8" }}>PENGELUARAN</p>
+            {group.expenses.length === 0 ? (
+              <p className="text-xs" style={{ color: "#CBD5E1" }}>Tidak ada pengeluaran</p>
+            ) : group.expenses.map((e) => (
+              <div key={e.id} className="flex justify-between text-xs py-1">
+                <span>{e.description} <span style={{ color: "#94A3B8" }}>({formatDateID(e.date)})</span></span>
+                <span style={{ color: "#DC2626" }}>{formatRupiah(e.amount)}</span>
+              </div>
+            ))}
+          </div>
+
+          <div className="rounded-xl p-4 text-center text-white font-bold" style={{ background: "linear-gradient(135deg,#4F46E5,#8B5CF6)" }}>
+            Saldo Akhir: {formatRupiah(cashBalance)}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // ---------- MAIN APP ----------
+  return (
+    <div className="min-h-screen pb-20" style={{ background: "#F1F5F9", fontFamily: "'Inter',sans-serif" }}>
+      {/* Top bar */}
+      <div className="text-white px-4 pt-5 pb-4" style={{ background: "linear-gradient(135deg,#6366F1,#8B5CF6)" }}>
+        <div className="flex items-center justify-between mb-3">
+          <div>
+            <h1 className="text-xl font-extrabold leading-none" style={{ fontFamily: "'Plus Jakarta Sans',sans-serif" }}>{data.appName}</h1>
+            <p className="text-xs italic opacity-80">{data.appTagline}</p>
+          </div>
+          <button onClick={() => setIsLoggedIn(false)} className="p-2 rounded-full" style={{ background: "rgba(255,255,255,0.2)" }}>🚪</button>
+        </div>
+        <div className="flex gap-2 mb-2.5">
+          {["A", "B"].map((g) => (
+            <button key={g} onClick={() => setSelectedGroup(g)}
+              className="flex-1 py-2 rounded-lg text-sm font-semibold transition-colors"
+              style={{ background: selectedGroup === g ? "white" : "rgba(255,255,255,0.15)", color: selectedGroup === g ? "#4F46E5" : "white" }}>
+              {data.groups[g].name}
+            </button>
+          ))}
+        </div>
+        <div className="flex items-center gap-2">
+          <select value={selectedMonth} onChange={(e) => setSelectedMonth(Number(e.target.value))}
+            className="flex-1 rounded-lg px-2 py-1.5 text-sm outline-none" style={{ background: "rgba(255,255,255,0.95)", color: "#334155" }}>
+            {BULAN_FULL.map((b, i) => <option key={b} value={i}>{b}</option>)}
+          </select>
+          <div className="flex items-center gap-1 rounded-lg px-1.5 py-1" style={{ background: "rgba(255,255,255,0.95)" }}>
+            <button onClick={() => setSelectedYear((y) => y - 1)}>‹</button>
+            <span className="text-sm text-slate-700 font-medium px-1">{selectedYear}</span>
+            <button onClick={() => setSelectedYear((y) => y + 1)}>›</button>
+          </div>
+        </div>
+      </div>
+
+      <div className="max-w-md mx-auto px-4 py-4">
+        {tab === "dashboard" && (
+          <>
+            <div className="grid grid-cols-2 gap-2.5 mb-4">
+              <BigCard icon={"💰"} label="Saldo Kas" value={formatRupiah(cashBalance)} bg="linear-gradient(135deg,#6366F1,#818CF8)" />
+              <BigCard icon={"📈"} label="Pemasukan" value={formatRupiah(monthlyIncome)} bg="linear-gradient(135deg,#10B981,#34D399)" />
+              <BigCard icon={"📉"} label="Pengeluaran" value={formatRupiah(monthlyExpenses)} bg="linear-gradient(135deg,#F43F5E,#FB7185)" />
+              <BigCard icon={"👥"} label="Total Anggota" value={group.members.length} bg="linear-gradient(135deg,#0EA5E9,#38BDF8)" />
+              <BigCard icon={"✅"} label="Sudah Bayar" value={paidCount} bg="linear-gradient(135deg,#22C55E,#4ADE80)" />
+              <BigCard icon={"❌"} label="Belum Bayar" value={unpaidCount} bg="linear-gradient(135deg,#EF4444,#F87171)" />
+              <BigCard icon={"🕒"} label="Libur" value={leaveCount} bg="linear-gradient(135deg,#F59E0B,#FBBF24)" full />
+            </div>
+
+            <div className="flex gap-2 mb-4">
+              <button onClick={() => setScreenshotMode(true)}
+                className="flex-1 flex items-center justify-center gap-1.5 py-2.5 rounded-xl text-sm font-semibold bg-white shadow-sm" style={{ color: "#4F46E5" }}>
+                📷 Screenshot Mode
+              </button>
+              <button onClick={handleDownloadPNG}
+                className="flex-1 flex items-center justify-center gap-1.5 py-2.5 rounded-xl text-sm font-semibold bg-white shadow-sm" style={{ color: "#16A34A" }}>
+                ⬇️ PNG
+              </button>
+            </div>
+            <button onClick={handleExportExcel}
+              className="w-full flex items-center justify-center gap-1.5 py-2.5 rounded-xl text-sm font-semibold bg-white shadow-sm mb-3" style={{ color: "#0EA5E9" }}>
+              ⬇️ Unduh Excel
+            </button>
+
+            {exportLinks.length > 0 && (
+              <div className="bg-white rounded-xl shadow-sm p-3 mb-5">
+                <p className="text-xs font-semibold mb-2" style={{ color: "#94A3B8" }}>FILE SIAP DISIMPAN</p>
+                <div className="flex flex-col gap-2">
+                  {exportLinks.map((f) => (
+                    <div key={f.id} className="flex items-center gap-2.5 border rounded-lg p-2" style={{ borderColor: "#E2E8F0" }}>
+                      {f.kind === "png" ? (
+                        <img src={f.url} alt={f.filename} className="w-12 h-16 object-cover rounded" style={{ border: "1px solid #E2E8F0" }} />
+                      ) : (
+                        <div className="w-10 h-10 rounded flex items-center justify-center" style={{ background: "#EEF2FF" }}>
+                          ⬇️
+                        </div>
+                      )}
+                      <div className="flex-1 min-w-0">
+                        <p className="text-xs font-medium truncate">{f.filename}</p>
+                        {f.kind === "png" && <p className="text-xs" style={{ color: "#CBD5E1" }}>Tekan &amp; tahan gambar untuk simpan ke galeri</p>}
+                      </div>
+                      <a href={f.url} download={f.filename} target="_blank" rel="noreferrer"
+                        className="px-3 py-1.5 rounded-lg text-xs font-semibold text-white shrink-0" style={{ background: "#4F46E5" }}>
+                        Simpan
+                      </a>
+                    </div>
+                  ))}
+                  <button onClick={() => setExportLinks([])} className="text-xs mt-1 self-start" style={{ color: "#94A3B8" }}>
+                    Bersihkan daftar
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* Add member */}
+            <div className="bg-white rounded-xl shadow-sm p-3 mb-3 flex gap-2">
+              <input value={newMemberName} onChange={(e) => setNewMemberName(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && addMember()}
+                placeholder="Nama anggota baru" className="flex-1 text-sm outline-none px-1" />
+              <button onClick={addMember} className="p-2 rounded-lg" style={{ background: "#EEF2FF" }}>
+                ➕
+              </button>
+            </div>
+
+            {/* Member list */}
+            <div className="bg-white rounded-xl shadow-sm overflow-hidden">
+              <p className="text-xs font-semibold px-3 pt-3" style={{ color: "#94A3B8" }}>DAFTAR ANGGOTA</p>
+              {memberRows.length === 0 ? (
+                <p className="text-sm text-center py-8" style={{ color: "#CBD5E1" }}>Belum ada anggota</p>
+              ) : (
+                <div className="px-1 pb-1">
+                  {memberRows.map((m, i) => (
+                    <div key={m.id} className="flex items-center justify-between px-2.5 py-2.5 border-b last:border-0" style={{ borderColor: "#F1F5F9" }}>
+                      <button onClick={() => { setMemberModal(m.id); setUseCustom(false); setCustomAmount(""); }} className="flex-1 text-left">
+                        <div className="flex items-center gap-2">
+                          <span className="text-xs w-5" style={{ color: "#CBD5E1" }}>{i + 1}</span>
+                          <span className="text-sm font-medium">{m.nama}</span>
+                        </div>
+                        <div className="flex items-center gap-2 mt-1 ml-7">
+                          <span className="text-xs font-semibold px-2 py-0.5 rounded-full" style={{ background: STATUS_STYLE[m.status].bg, color: STATUS_STYLE[m.status].fg }}>
+                            {STATUS_STYLE[m.status].label}
+                          </span>
+                          <span className="text-xs" style={{ color: "#64748B" }}>{m.status === "paid" ? formatRupiah(m.amount) : "-"}</span>
+                          <span className="text-xs" style={{ color: "#CBD5E1" }}>{m.status === "paid" ? formatDateID(m.paymentDate) : ""}</span>
+                        </div>
+                      </button>
+                      <button onClick={() => removeMember(m.id, m.nama)} className="p-1.5">🗑️</button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </>
+        )}
+
+        {tab === "expenses" && (
+          <>
+            <div className="bg-white rounded-xl shadow-sm p-3.5 mb-4">
+              <p className="text-xs font-semibold mb-2" style={{ color: "#94A3B8" }}>CATAT PENGELUARAN — {group.name}</p>
+              <input type="date" value={expDate} onChange={(e) => setExpDate(e.target.value)}
+                className="w-full border rounded-lg px-3 py-2 text-sm mb-2 outline-none" style={{ borderColor: "#E2E8F0" }} />
+              <input value={expDesc} onChange={(e) => setExpDesc(e.target.value)} placeholder="Jenis / keterangan pengeluaran"
+                className="w-full border rounded-lg px-3 py-2 text-sm mb-2 outline-none" style={{ borderColor: "#E2E8F0" }} />
+              <input value={expAmount} onChange={(e) => setExpAmount(e.target.value)} placeholder="Nominal" inputMode="numeric"
+                className="w-full border rounded-lg px-3 py-2 text-sm mb-2.5 outline-none" style={{ borderColor: "#E2E8F0" }} />
+              <button onClick={addExpense} className="w-full py-2.5 rounded-lg text-white text-sm font-semibold" style={{ background: "#F43F5E" }}>
+                Catat Pengeluaran
+              </button>
+            </div>
+            <div className="bg-white rounded-xl shadow-sm overflow-hidden">
+              <p className="text-xs font-semibold px-3.5 pt-3" style={{ color: "#94A3B8" }}>RIWAYAT PENGELUARAN</p>
+              {group.expenses.length === 0 ? (
+                <p className="text-sm text-center py-8" style={{ color: "#CBD5E1" }}>Belum ada pengeluaran</p>
+              ) : (
+                <div className="px-1 pb-1 mt-1">
+                  {[...group.expenses].sort((a, b) => new Date(b.date) - new Date(a.date)).map((e) => (
+                    <div key={e.id} className="flex items-center justify-between px-2.5 py-2.5 border-b last:border-0" style={{ borderColor: "#F1F5F9" }}>
+                      <div>
+                        <p className="text-sm font-medium">{e.description}</p>
+                        <p className="text-xs" style={{ color: "#94A3B8" }}>{formatDateID(e.date)}</p>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <span className="text-sm font-semibold" style={{ color: "#DC2626" }}>{formatRupiah(e.amount)}</span>
+                        <button onClick={() => removeExpense(e.id, e.description)}>🗑️</button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </>
+        )}
+
+        {tab === "cashbook" && (
+          <div className="bg-white rounded-xl shadow-sm overflow-hidden">
+            <p className="text-xs font-semibold px-3.5 pt-3 pb-2" style={{ color: "#94A3B8" }}>BUKU KAS — {group.name}</p>
+            <div className="flex justify-between px-3.5 py-2 border-b" style={{ borderColor: "#F1F5F9", background: "#F8FAFC" }}>
+              <span className="text-xs font-semibold" style={{ color: "#64748B" }}>Saldo Awal</span>
+              <span className="text-xs font-semibold" style={{ color: "#334155" }}>{formatRupiah(group.openingBalance)}</span>
+            </div>
+            {cashBookRows.length === 0 ? (
+              <p className="text-sm text-center py-8" style={{ color: "#CBD5E1" }}>Belum ada transaksi</p>
+            ) : (
+              <div className="px-1 pb-1">
+                {cashBookRows.map((r, i) => (
+                  <div key={i} className="px-2.5 py-2 border-b last:border-0" style={{ borderColor: "#F1F5F9" }}>
+                    <div className="flex justify-between">
+                      <span className="text-xs" style={{ color: "#94A3B8" }}>{formatDateID(r.date)}</span>
+                      <span className="text-xs font-semibold" style={{ color: "#334155" }}>Saldo: {formatRupiah(r.balance)}</span>
+                    </div>
+                    <div className="flex justify-between items-center">
+                      <span className="text-sm">{r.desc}</span>
+                      <span className="text-sm font-medium" style={{ color: r.income > 0 ? "#16A34A" : "#DC2626" }}>
+                        {r.income > 0 ? `+${formatRupiah(r.income)}` : `-${formatRupiah(r.expense)}`}
+                      </span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {tab === "reports" && (
+          <div className="flex flex-col gap-3">
+            <div className="flex gap-1.5 bg-white rounded-xl p-1 shadow-sm">
+              {[["monthly", "Bulanan"], ["yearly", "Tahunan"], ["group", "Antar Grup"]].map(([val, label]) => (
+                <button key={val} onClick={() => setReportView(val)}
+                  className="flex-1 py-2 rounded-lg text-xs font-semibold"
+                  style={{ background: reportView === val ? "#4F46E5" : "transparent", color: reportView === val ? "white" : "#64748B" }}>
+                  {label}
+                </button>
+              ))}
+            </div>
+
+            {reportView === "monthly" && (
+              <div className="bg-white rounded-xl shadow-sm p-3.5">
+                <p className="text-xs font-semibold mb-3" style={{ color: "#94A3B8" }}>
+                  LAPORAN BULANAN — {group.name} · {BULAN_FULL[selectedMonth]} {selectedYear}
+                </p>
+                <ReportRow label="Pemasukan" value={formatRupiah(monthlyIncome)} color="#16A34A" />
+                <ReportRow label="Pengeluaran" value={formatRupiah(monthlyExpenses)} color="#DC2626" />
+                <ReportRow label="Selisih Bulan Ini" value={formatRupiah(monthlyIncome - monthlyExpenses)} color="#4F46E5" />
+                <ReportRow label="Anggota Bayar" value={`${paidCount} / ${memberRows.length}`} color="#334155" />
+                <ReportRow label="Saldo Kas (kumulatif)" value={formatRupiah(cashBalance)} color="#4F46E5" bold />
+              </div>
+            )}
+
+            {reportView === "yearly" && (
+              <div className="bg-white rounded-xl shadow-sm p-3.5 overflow-x-auto">
+                <p className="text-xs font-semibold mb-3" style={{ color: "#94A3B8" }}>LAPORAN TAHUNAN — {group.name} · {selectedYear}</p>
+                <table className="w-full text-xs">
+                  <thead>
+                    <tr style={{ color: "#94A3B8" }}>
+                      <th className="text-left py-1">Bulan</th>
+                      <th className="text-right py-1">Masuk</th>
+                      <th className="text-right py-1">Keluar</th>
+                      <th className="text-right py-1">Net</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {yearlyBreakdown.map((r) => (
+                      <tr key={r.label} className="border-t" style={{ borderColor: "#F1F5F9" }}>
+                        <td className="py-1.5">{r.label}</td>
+                        <td className="py-1.5 text-right" style={{ color: "#16A34A" }}>{formatRupiah(r.income)}</td>
+                        <td className="py-1.5 text-right" style={{ color: "#DC2626" }}>{formatRupiah(r.expense)}</td>
+                        <td className="py-1.5 text-right font-semibold" style={{ color: r.net >= 0 ? "#334155" : "#DC2626" }}>{formatRupiah(r.net)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+                <div className="mt-3 pt-3 border-t" style={{ borderColor: "#E2E8F0" }}>
+                  <ReportRow label="Saldo Akhir Tahun" value={formatRupiah(cashBalance)} color="#4F46E5" bold />
+                </div>
+              </div>
+            )}
+
+            {reportView === "group" && (
+              <div className="flex flex-col gap-3">
+                {groupComparison.map((g) => (
+                  <div key={g.key} className="bg-white rounded-xl shadow-sm p-3.5">
+                    <p className="text-sm font-bold mb-2">{g.name}</p>
+                    <ReportRow label="Anggota" value={g.members} color="#334155" />
+                    <ReportRow label="Total Pemasukan" value={formatRupiah(g.income)} color="#16A34A" />
+                    <ReportRow label="Total Pengeluaran" value={formatRupiah(g.expense)} color="#DC2626" />
+                    <ReportRow label="Saldo" value={formatRupiah(g.balance)} color="#4F46E5" bold />
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {tab === "settings" && (
+          <div className="flex flex-col gap-3">
+            <div className="bg-white rounded-xl shadow-sm p-3.5">
+              <p className="text-xs font-semibold mb-2" style={{ color: "#94A3B8" }}>APLIKASI</p>
+              <label className="text-xs" style={{ color: "#94A3B8" }}>Nama Aplikasi</label>
+              <input value={data.appName} onChange={(e) => setData((d) => ({ ...d, appName: e.target.value }))}
+                className="w-full border rounded-lg px-3 py-2 text-sm mb-2.5 mt-1 outline-none" style={{ borderColor: "#E2E8F0" }} />
+              <label className="text-xs" style={{ color: "#94A3B8" }}>Tagline</label>
+              <input value={data.appTagline} onChange={(e) => setData((d) => ({ ...d, appTagline: e.target.value }))}
+                className="w-full border rounded-lg px-3 py-2 text-sm mt-1 outline-none" style={{ borderColor: "#E2E8F0" }} />
+            </div>
+
+            <div className="bg-white rounded-xl shadow-sm p-3.5">
+              <p className="text-xs font-semibold mb-2" style={{ color: "#94A3B8" }}>PENGATURAN {group.name.toUpperCase()}</p>
+              <label className="text-xs" style={{ color: "#94A3B8" }}>Nama Grup</label>
+              <input value={group.name} onChange={(e) => updateGroup(() => ({ name: e.target.value }))}
+                className="w-full border rounded-lg px-3 py-2 text-sm mb-2.5 mt-1 outline-none" style={{ borderColor: "#E2E8F0" }} />
+              <label className="text-xs" style={{ color: "#94A3B8" }}>Nominal Iuran Default</label>
+              <input value={group.defaultAmount} onChange={(e) => {
+                  const v = parseFloat(e.target.value.replace(/[^0-9.-]/g, "")) || 0;
+                  const old = group.defaultAmount;
+                  updateGroup(() => ({ defaultAmount: v }));
+                  if (v !== old) logActivity(`Nominal iuran ${group.name} diubah dari ${formatRupiah(old)} ke ${formatRupiah(v)}`);
+                }}
+                className="w-full border rounded-lg px-3 py-2 text-sm mb-2.5 mt-1 outline-none" style={{ borderColor: "#E2E8F0" }} />
+              <label className="text-xs" style={{ color: "#94A3B8" }}>Saldo Awal</label>
+              <input value={group.openingBalance} onChange={(e) => updateGroup(() => ({ openingBalance: parseFloat(e.target.value.replace(/[^0-9.-]/g, "")) || 0 }))}
+                className="w-full border rounded-lg px-3 py-2 text-sm mt-1 outline-none" style={{ borderColor: "#E2E8F0" }} />
+            </div>
+
+            <div className="bg-white rounded-xl shadow-sm p-3.5">
+              <p className="text-xs font-semibold mb-2" style={{ color: "#94A3B8" }}>AKUN LOGIN</p>
+              <label className="text-xs" style={{ color: "#94A3B8" }}>Username</label>
+              <input value={data.auth.username} onChange={(e) => setData((d) => ({ ...d, auth: { ...d.auth, username: e.target.value } }))}
+                className="w-full border rounded-lg px-3 py-2 text-sm mb-2.5 mt-1 outline-none" style={{ borderColor: "#E2E8F0" }} />
+              <label className="text-xs" style={{ color: "#94A3B8" }}>Password</label>
+              <input value={data.auth.password} onChange={(e) => setData((d) => ({ ...d, auth: { ...d.auth, password: e.target.value } }))}
+                className="w-full border rounded-lg px-3 py-2 text-sm mt-1 outline-none" style={{ borderColor: "#E2E8F0" }} />
+              <p className="text-xs mt-2" style={{ color: "#CBD5E1" }}>Login ini disimpan di penyimpanan pribadi akun Claude kamu, bukan sistem autentikasi server sungguhan.</p>
+            </div>
+
+            <div className="bg-white rounded-xl shadow-sm p-3.5">
+              <p className="text-xs font-semibold mb-2" style={{ color: "#94A3B8" }}>BACKUP & RESTORE</p>
+              <button onClick={handleBackup} className="w-full py-2.5 rounded-lg text-sm font-semibold mb-2" style={{ background: "#EEF2FF", color: "#4F46E5" }}>
+                Backup Data (.json)
+              </button>
+              <button onClick={() => restoreInputRef.current && restoreInputRef.current.click()}
+                className="w-full py-2.5 rounded-lg text-sm font-semibold" style={{ background: "#F0FDF4", color: "#16A34A" }}>
+                Restore Data (.json)
+              </button>
+              <input ref={restoreInputRef} type="file" accept="application/json" className="hidden"
+                onChange={(e) => handleRestoreFile(e.target.files && e.target.files[0])} />
+              {restoreMsg && <p className="text-xs mt-2" style={{ color: restoreMsg.startsWith("Gagal") ? "#DC2626" : "#16A34A" }}>{restoreMsg}</p>}
+              <p className="text-xs mt-2" style={{ color: "#CBD5E1" }}>Restore akan mengganti seluruh data (Group A & B) dengan isi file backup.</p>
+            </div>
+          </div>
+        )}
+
+        {tab === "log" && (
+          <div className="bg-white rounded-xl shadow-sm overflow-hidden">
+            <p className="text-xs font-semibold px-3.5 pt-3 pb-2" style={{ color: "#94A3B8" }}>LOG AKTIVITAS</p>
+            {data.activityLog.length === 0 ? (
+              <p className="text-sm text-center py-8" style={{ color: "#CBD5E1" }}>Belum ada aktivitas</p>
+            ) : (
+              <div className="px-3.5 pb-3">
+                {data.activityLog.map((l) => (
+                  <div key={l.id} className="py-2 border-b last:border-0" style={{ borderColor: "#F1F5F9" }}>
+                    <p className="text-xs" style={{ color: "#94A3B8" }}>
+                      {new Date(l.date).toLocaleString("id-ID")} · Group {l.group}
+                    </p>
+                    <p className="text-sm">{l.text}</p>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {saveError && <p className="text-xs mt-3 text-center" style={{ color: "#DC2626" }}>Gagal menyimpan otomatis.</p>}
+      </div>
+
+      {/* Bottom nav */}
+      <div className="fixed bottom-0 left-0 right-0 bg-white border-t flex" style={{ borderColor: "#E2E8F0" }}>
+        {[
+          ["dashboard", "🏠", "Utama"],
+          ["expenses", "🧾", "Keluar"],
+          ["cashbook", "📖", "Kas"],
+          ["reports", "📄", "Laporan"],
+          ["settings", "⚙️", "Atur"],
+          ["log", "📜", "Log"],
+        ].map(([key, emoji, label]) => (
+          <button key={key} onClick={() => setTab(key)} className="flex-1 flex flex-col items-center py-2 gap-0.5">
+            <span style={{ fontSize: 18, opacity: tab === key ? 1 : 0.6 }}>{emoji}</span>
+            <span className="text-xs font-medium" style={{ color: tab === key ? "#4F46E5" : "#94A3B8" }}>{label}</span>
+          </button>
+        ))}
+      </div>
+
+      {/* Member action modal */}
+      {modalMember && (
+        <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center" style={{ background: "rgba(15,23,42,0.45)" }} onClick={() => setMemberModal(null)}>
+          <div className="bg-white rounded-t-2xl sm:rounded-2xl w-full sm:max-w-sm p-5" onClick={(e) => e.stopPropagation()}>
+            <div className="flex items-center justify-between mb-1">
+              <h3 className="text-base font-bold" style={{ fontFamily: "'Plus Jakarta Sans',sans-serif" }}>{modalMember.nama}</h3>
+              <button onClick={() => setMemberModal(null)}>✕</button>
+            </div>
+            <p className="text-xs mb-4" style={{ color: "#94A3B8" }}>{BULAN_FULL[selectedMonth]} {selectedYear} · {group.name}</p>
+
+            <button onClick={() => markPaid(modalMember.id, modalMember.nama, group.defaultAmount)}
+              className="w-full py-3 rounded-xl text-sm font-semibold mb-2 text-white" style={{ background: "#16A34A" }}>
+              ✓ Tandai Lunas — {formatRupiah(group.defaultAmount)}
+            </button>
+
+            {!useCustom ? (
+              <button onClick={() => setUseCustom(true)} className="w-full py-2.5 rounded-xl text-sm font-medium mb-2 border" style={{ borderColor: "#E2E8F0", color: "#4F46E5" }}>
+                Gunakan Nominal Custom
+              </button>
+            ) : (
+              <div className="flex gap-2 mb-2">
+                <input value={customAmount} onChange={(e) => setCustomAmount(e.target.value)} placeholder="Nominal custom" inputMode="numeric"
+                  className="flex-1 border rounded-xl px-3 py-2.5 text-sm outline-none" style={{ borderColor: "#E2E8F0" }} />
+                <button onClick={() => {
+                    const n = parseFloat(String(customAmount).replace(/[^0-9.-]/g, ""));
+                    if (n > 0) markPaid(modalMember.id, modalMember.nama, n);
+                  }}
+                  className="px-4 rounded-xl text-white text-sm font-semibold" style={{ background: "#4F46E5" }}>
+                  Simpan
+                </button>
+              </div>
+            )}
+
+            <button onClick={() => markLeave(modalMember.id, modalMember.nama)}
+              className="w-full py-2.5 rounded-xl text-sm font-semibold mb-2" style={{ background: "#FEF3C7", color: "#B45309" }}>
+              Tandai Libur
+            </button>
+            <button onClick={() => markUnpaid(modalMember.id, modalMember.nama)}
+              className="w-full py-2.5 rounded-xl text-sm font-semibold" style={{ background: "#FEE2E2", color: "#B91C1C" }}>
+              Tandai Belum Bayar
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function BigCard({ icon, label, value, bg, full }) {
+  return (
+    <div className={`rounded-xl p-3.5 ${full ? "col-span-2" : ""}`} style={{ background: bg }}>
+      <div className="flex items-center gap-1.5 mb-1.5 opacity-90">
+        {icon}
+        <span className="text-xs font-semibold text-white uppercase tracking-wide">{label}</span>
+      </div>
+      <p className="text-lg font-extrabold text-white" style={{ fontFamily: "'Plus Jakarta Sans',sans-serif" }}>{value}</p>
+    </div>
+  );
+}
+
+function SummaryCard({ label, value, color }) {
+  return (
+    <div className="bg-white rounded-lg p-2.5 shadow-sm">
+      <p className="text-xs font-semibold uppercase" style={{ color: "#94A3B8" }}>{label}</p>
+      <p className="text-sm font-bold" style={{ color }}>{value}</p>
+    </div>
+  );
+}
+
+function ReportRow({ label, value, color, bold }) {
+  return (
+    <div className="flex justify-between items-center py-1.5">
+      <span className="text-sm" style={{ color: "#64748B" }}>{label}</span>
+      <span className={bold ? "text-base font-bold" : "text-sm font-semibold"} style={{ color }}>{value}</span>
+    </div>
+  );
+}
+
+function MemberLine({ idx, m }) {
+  const st = STATUS_STYLE[m.status];
+  return (
+    <div className="flex items-center justify-between py-1.5 border-b last:border-0" style={{ borderColor: "#F8FAFC" }}>
+      <span className="text-xs flex-1"><span style={{ color: "#CBD5E1" }}>{idx}.</span> {m.nama}</span>
+      <span className="text-xs font-semibold px-2 py-0.5 rounded-full mr-2" style={{ background: st.bg, color: st.fg }}>{st.label}</span>
+      <span className="text-xs w-20 text-right" style={{ color: "#64748B" }}>{m.status === "paid" ? formatRupiah(m.amount) : "-"}</span>
+    </div>
+  );
+}
+
+
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(<Maestro />);
+</script>
+</body>
+</html>
