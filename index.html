@@ -429,6 +429,106 @@ function Maestro() {
     setExportLinks((prev) => [{ id: uid("png"), kind: "png", filename, url: dataUrl, page: pageNum, totalPages }, ...prev]);
   }
 
+  // ---- Expense-only PNG export (all expenses, detail + akumulasi + sisa saldo) ----
+  const handleDownloadExpensePNG = () => {
+    const allExpenses = [...group.expenses].sort((a, b) => new Date(b.date) - new Date(a.date));
+    const ROWS_PER_PAGE = 26;
+    const pages = Math.max(1, Math.ceil(allExpenses.length / ROWS_PER_PAGE));
+    for (let p = 0; p < pages; p++) {
+      const pageExpenses = allExpenses.slice(p * ROWS_PER_PAGE, (p + 1) * ROWS_PER_PAGE);
+      drawExpenseReportPage(pageExpenses, p + 1, pages, allExpenses.length);
+    }
+    logActivity(`PNG Pengeluaran ${group.name} dibuat (${pages} halaman)`);
+  };
+
+  function drawExpenseReportPage(pageExpenses, pageNum, totalPages, totalCount) {
+    const W = 720;
+    const rowH = 30;
+    const topH = 230;
+    const bottomH = 140;
+    const H = topH + pageExpenses.length * rowH + bottomH;
+    const canvas = document.createElement("canvas");
+    canvas.width = W; canvas.height = H;
+    const ctx = canvas.getContext("2d");
+
+    ctx.fillStyle = "#F8FAFC"; ctx.fillRect(0, 0, W, H);
+
+    // Header band
+    const grad = ctx.createLinearGradient(0, 0, W, 0);
+    grad.addColorStop(0, "#F43F5E"); grad.addColorStop(1, "#EC4899");
+    ctx.fillStyle = grad; ctx.fillRect(0, 0, W, 86);
+    ctx.fillStyle = "#FFFFFF";
+    ctx.font = "700 26px 'Plus Jakarta Sans', sans-serif";
+    ctx.fillText(data.appName, 24, 40);
+    ctx.font = "500 13px Inter, sans-serif";
+    ctx.fillStyle = "rgba(255,255,255,0.85)";
+    ctx.fillText("Detail Pengeluaran", 24, 62);
+    ctx.textAlign = "right";
+    ctx.font = "600 15px Inter, sans-serif";
+    ctx.fillText(`${group.name}`, W - 24, 38);
+    ctx.font = "400 13px Inter, sans-serif";
+    ctx.fillText(`${totalCount} transaksi`, W - 24, 58);
+    ctx.textAlign = "left";
+
+    // Summary cards: Akumulasi Pengeluaran, Sisa Saldo
+    const cards = [
+      ["Akumulasi Pengeluaran", formatRupiah(allTimeExpenses), "#DC2626"],
+      ["Sisa Saldo", formatRupiah(cashBalance), "#4F46E5"],
+    ];
+    const cw = (W - 24 * 2 - 8) / 2;
+    cards.forEach((c, i) => {
+      const x = 24 + i * (cw + 8), y = 100;
+      ctx.fillStyle = "#FFFFFF";
+      roundRect(ctx, x, y, cw, 60, 10); ctx.fill();
+      ctx.fillStyle = "#94A3B8"; ctx.font = "600 10px Inter, sans-serif";
+      ctx.fillText(c[0].toUpperCase(), x + 12, y + 20);
+      ctx.fillStyle = c[2]; ctx.font = "700 18px 'Plus Jakarta Sans', sans-serif";
+      ctx.fillText(c[1], x + 12, y + 45);
+    });
+
+    // Table header
+    let y = 195;
+    ctx.fillStyle = "#1E293B"; ctx.font = "700 12px Inter, sans-serif";
+    ctx.fillText("No", 24, y);
+    ctx.fillText("Tanggal", 60, y);
+    ctx.fillText("Keterangan", 165, y);
+    ctx.fillText("Nominal", 560, y);
+    y += 10;
+    ctx.strokeStyle = "#E2E8F0"; ctx.beginPath(); ctx.moveTo(24, y); ctx.lineTo(W - 24, y); ctx.stroke();
+
+    pageExpenses.forEach((e, idx) => {
+      const ry = y + 22 + idx * rowH;
+      const globalIdx = allTimeExpenseIndex(e) ;
+      ctx.fillStyle = "#334155"; ctx.font = "500 12px Inter, sans-serif";
+      ctx.fillText(String(globalIdx), 24, ry);
+      ctx.fillText(formatDateID(e.date), 60, ry);
+      const desc = e.description.length > 42 ? e.description.slice(0, 41) + "…" : e.description;
+      ctx.fillText(desc, 165, ry);
+      ctx.fillStyle = "#DC2626"; ctx.font = "600 12px Inter, sans-serif";
+      ctx.fillText(formatRupiah(e.amount), 560, ry);
+      ctx.strokeStyle = "#F1F5F9"; ctx.beginPath(); ctx.moveTo(24, ry + 8); ctx.lineTo(W - 24, ry + 8); ctx.stroke();
+    });
+
+    // Footer
+    let fy = topH + pageExpenses.length * rowH + 20;
+    ctx.strokeStyle = "#CBD5E1"; ctx.beginPath(); ctx.moveTo(24, fy - 14); ctx.lineTo(W - 24, fy - 14); ctx.stroke();
+    ctx.font = "700 13px 'Plus Jakarta Sans', sans-serif"; ctx.fillStyle = "#DC2626";
+    ctx.fillText(`Total Akumulasi Pengeluaran: ${formatRupiah(allTimeExpenses)}`, 24, fy); fy += 20;
+    ctx.fillStyle = "#4F46E5";
+    ctx.fillText(`Sisa Saldo: ${formatRupiah(cashBalance)}`, 24, fy); fy += 22;
+    ctx.font = "400 10px Inter, sans-serif"; ctx.fillStyle = "#94A3B8";
+    ctx.fillText(`Dibuat ${new Date().toLocaleString("id-ID")} — Hal ${pageNum}/${totalPages}`, 24, fy);
+
+    const filename = `maestro-pengeluaran-${selectedGroup}-hal${pageNum}.png`;
+    const dataUrl = canvas.toDataURL("image/png");
+    setExportLinks((prev) => [{ id: uid("png"), kind: "png", filename, url: dataUrl, page: pageNum, totalPages }, ...prev]);
+  }
+
+  function allTimeExpenseIndex(expense) {
+    const chronological = [...group.expenses].sort((a, b) => new Date(a.date) - new Date(b.date));
+    return chronological.findIndex((e) => e.id === expense.id) + 1;
+  }
+
   function roundRect(ctx, x, y, w, h, r) {
     ctx.beginPath();
     ctx.moveTo(x + r, y);
@@ -596,35 +696,7 @@ function Maestro() {
               ⬇️ Unduh Excel
             </button>
 
-            {exportLinks.length > 0 && (
-              <div className="bg-white rounded-xl shadow-sm p-3 mb-5">
-                <p className="text-xs font-semibold mb-2" style={{ color: "#94A3B8" }}>FILE SIAP DISIMPAN</p>
-                <div className="flex flex-col gap-2">
-                  {exportLinks.map((f) => (
-                    <div key={f.id} className="flex items-center gap-2.5 border rounded-lg p-2" style={{ borderColor: "#E2E8F0" }}>
-                      {f.kind === "png" ? (
-                        <img src={f.url} alt={f.filename} className="w-12 h-16 object-cover rounded" style={{ border: "1px solid #E2E8F0" }} />
-                      ) : (
-                        <div className="w-10 h-10 rounded flex items-center justify-center" style={{ background: "#EEF2FF" }}>
-                          ⬇️
-                        </div>
-                      )}
-                      <div className="flex-1 min-w-0">
-                        <p className="text-xs font-medium truncate">{f.filename}</p>
-                        {f.kind === "png" && <p className="text-xs" style={{ color: "#CBD5E1" }}>Tekan &amp; tahan gambar untuk simpan ke galeri</p>}
-                      </div>
-                      <a href={f.url} download={f.filename} target="_blank" rel="noreferrer"
-                        className="px-3 py-1.5 rounded-lg text-xs font-semibold text-white shrink-0" style={{ background: "#4F46E5" }}>
-                        Simpan
-                      </a>
-                    </div>
-                  ))}
-                  <button onClick={() => setExportLinks([])} className="text-xs mt-1 self-start" style={{ color: "#94A3B8" }}>
-                    Bersihkan daftar
-                  </button>
-                </div>
-              </div>
-            )}
+            <ExportLinksPanel exportLinks={exportLinks} setExportLinks={setExportLinks} />
 
             {/* Add member */}
             <div className="bg-white rounded-xl shadow-sm p-3 mb-3 flex gap-2">
@@ -694,7 +766,14 @@ function Maestro() {
                 </div>
               </div>
               <p className="text-xs mt-2.5" style={{ color: "#CBD5E1" }}>Sisa saldo = total uang terkumpul (semua pemasukan) dikurangi total pengeluaran, sepanjang waktu.</p>
+              <button onClick={handleDownloadExpensePNG}
+                className="w-full flex items-center justify-center gap-1.5 py-2.5 rounded-xl text-sm font-semibold mt-3" style={{ background: "#FEF2F2", color: "#DC2626" }}>
+                ⬇️ Download PNG Pengeluaran (semua data)
+              </button>
             </div>
+
+            <ExportLinksPanel exportLinks={exportLinks} setExportLinks={setExportLinks} />
+
             <div className="bg-white rounded-xl shadow-sm overflow-hidden">
               <p className="text-xs font-semibold px-3.5 pt-3" style={{ color: "#94A3B8" }}>RIWAYAT PENGELUARAN — DETAIL</p>
               {group.expenses.length === 0 ? (
@@ -977,6 +1056,39 @@ function Maestro() {
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+function ExportLinksPanel({ exportLinks, setExportLinks }) {
+  if (exportLinks.length === 0) return null;
+  return (
+    <div className="bg-white rounded-xl shadow-sm p-3 mb-5">
+      <p className="text-xs font-semibold mb-2" style={{ color: "#94A3B8" }}>FILE SIAP DISIMPAN</p>
+      <div className="flex flex-col gap-2">
+        {exportLinks.map((f) => (
+          <div key={f.id} className="flex items-center gap-2.5 border rounded-lg p-2" style={{ borderColor: "#E2E8F0" }}>
+            {f.kind === "png" ? (
+              <img src={f.url} alt={f.filename} className="w-12 h-16 object-cover rounded" style={{ border: "1px solid #E2E8F0" }} />
+            ) : (
+              <div className="w-10 h-10 rounded flex items-center justify-center" style={{ background: "#EEF2FF" }}>
+                ⬇️
+              </div>
+            )}
+            <div className="flex-1 min-w-0">
+              <p className="text-xs font-medium truncate">{f.filename}</p>
+              {f.kind === "png" && <p className="text-xs" style={{ color: "#CBD5E1" }}>Tekan &amp; tahan gambar untuk simpan ke galeri</p>}
+            </div>
+            <a href={f.url} download={f.filename} target="_blank" rel="noreferrer"
+              className="px-3 py-1.5 rounded-lg text-xs font-semibold text-white shrink-0" style={{ background: "#4F46E5" }}>
+              Simpan
+            </a>
+          </div>
+        ))}
+        <button onClick={() => setExportLinks([])} className="text-xs mt-1 self-start" style={{ color: "#94A3B8" }}>
+          Bersihkan daftar
+        </button>
+      </div>
     </div>
   );
 }
