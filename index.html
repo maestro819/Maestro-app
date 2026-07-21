@@ -300,11 +300,20 @@ function Maestro() {
   };
 
   // ---- Backup / Restore ----
+  const [backupMsg, setBackupMsg] = useState("");
   const handleBackup = () => {
     const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
     const url = URL.createObjectURL(blob);
-    setExportLinks((prev) => [{ id: uid("bak"), kind: "backup", filename: `maestro-backup-${todayISO()}.json`, url }, ...prev]);
-    logActivity("Backup data dibuat");
+    const filename = `maestro-backup-${todayISO()}.json`;
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
+    setBackupMsg(`Backup "${filename}" sudah diunduh — cek folder Downloads/Files di HP kamu.`);
+    logActivity("Backup data diunduh");
   };
 
   const handleRestoreFile = (file) => {
@@ -956,7 +965,7 @@ function Maestro() {
               <label className="text-xs" style={{ color: "#94A3B8" }}>Password</label>
               <input value={data.auth.password} onChange={(e) => setData((d) => ({ ...d, auth: { ...d.auth, password: e.target.value } }))}
                 className="w-full border rounded-lg px-3 py-2 text-sm mt-1 outline-none" style={{ borderColor: "#E2E8F0" }} />
-              <p className="text-xs mt-2" style={{ color: "#CBD5E1" }}>Login ini disimpan di penyimpanan pribadi akun Claude kamu, bukan sistem autentikasi server sungguhan.</p>
+              <p className="text-xs mt-2" style={{ color: "#CBD5E1" }}>Login ini disimpan di penyimpanan browser HP kamu (localStorage), bukan sistem autentikasi server sungguhan. Kalau cache browser di-clear, username/password ini ikut ke-reset ke admin/admin123.</p>
             </div>
 
             <div className="bg-white rounded-xl shadow-sm p-3.5">
@@ -964,6 +973,7 @@ function Maestro() {
               <button onClick={handleBackup} className="w-full py-2.5 rounded-lg text-sm font-semibold mb-2" style={{ background: "#EEF2FF", color: "#4F46E5" }}>
                 Backup Data (.json)
               </button>
+              {backupMsg && <p className="text-xs mb-2" style={{ color: "#16A34A" }}>{backupMsg}</p>}
               <button onClick={() => restoreInputRef.current && restoreInputRef.current.click()}
                 className="w-full py-2.5 rounded-lg text-sm font-semibold" style={{ background: "#F0FDF4", color: "#16A34A" }}>
                 Restore Data (.json)
