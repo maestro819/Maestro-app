@@ -51,6 +51,15 @@ function formatRupiah(n) {
   const v = Math.round(n || 0);
   return (v < 0 ? "-Rp " : "Rp ") + Math.abs(v).toLocaleString("id-ID");
 }
+function formatRupiahCompact(n) {
+  const v = Math.round(n || 0);
+  if (v === 0) return "0";
+  if (v % 1000000 === 0) return `${v / 1000000}jt`;
+  if (v % 1000 === 0) return `${(v / 1000).toLocaleString("id-ID")}rb`;
+  if (v >= 1000000) return `${(v / 1000000).toLocaleString("id-ID", { maximumFractionDigits: 1 })}jt`;
+  if (v >= 1000) return `${(v / 1000).toLocaleString("id-ID", { maximumFractionDigits: 1 })}rb`;
+  return String(v);
+}
 function todayISO() { return new Date().toISOString().slice(0, 10); }
 function formatDateID(iso) {
   if (!iso) return "-";
@@ -274,6 +283,11 @@ function Maestro() {
     }));
   }, [selectedGroup]);
 
+  const handleClearLog = () => {
+    if (!confirm("Hapus semua log aktivitas? Data anggota, pembayaran, dan kas tidak akan terpengaruh.")) return;
+    setData((d) => ({ ...d, activityLog: [] }));
+  };
+
   const group = data.groups[selectedGroup];
 
   const handleLogin = () => {
@@ -405,16 +419,16 @@ function Maestro() {
   }, [group, selectedYear]);
 
   const memberYearlyMatrix = useMemo(() => {
-    return group.members.map((m) => ({
-      id: m.id,
-      nama: m.nama,
-      months: BULAN.map((_, month) => {
+    return group.members.map((m) => {
+      let total = 0;
+      const months = BULAN.map((_, month) => {
         const p = group.payments[payKey(m.id, selectedYear, month)];
-        if (p && p.status === "paid") return "paid";
-        if (p && p.status === "leave") return "leave";
-        return "unpaid";
-      }),
-    }));
+        if (p && p.status === "paid") { total += p.amount; return { status: "paid", amount: p.amount }; }
+        if (p && p.status === "leave") return { status: "leave", amount: 0 };
+        return { status: "unpaid", amount: 0 };
+      });
+      return { id: m.id, nama: m.nama, months, total };
+    });
   }, [group, selectedYear]);
 
   const yearlyIncomeTotal = useMemo(() => yearlyBreakdown.reduce((s, r) => s + r.income, 0), [yearlyBreakdown]);
@@ -627,25 +641,27 @@ function Maestro() {
     setExportLinks((prev) => [{ id: uid("png"), kind: "png", filename, url: dataUrl, page: pageNum, totalPages }, ...prev]);
   }
 
-  // ---- Yearly summary PNG export (matrix: Nama x 12 bulan, hanya keterangan status) ----
+  // ---- Yearly report PNG export (matrix: Nama x 12 bulan, nominal/status + total) ----
   const handleDownloadYearlyPNG = () => {
     const ROWS_PER_PAGE = 20;
     const pages = Math.max(1, Math.ceil(memberYearlyMatrix.length / ROWS_PER_PAGE));
     for (let p = 0; p < pages; p++) {
       const pageMembers = memberYearlyMatrix.slice(p * ROWS_PER_PAGE, (p + 1) * ROWS_PER_PAGE);
-      drawYearlyReportPage(pageMembers, p + 1, pages);
+      drawYearlyReportPage(pageMembers, p + 1, pages, p === pages - 1);
     }
-    logActivity(`PNG Rangkuman Tahunan ${group.name} ${selectedYear} dibuat (${pages} halaman)`);
+    logActivity(`PNG Laporan Tahunan ${group.name} ${selectedYear} dibuat (${pages} halaman)`);
   };
 
-  function drawYearlyReportPage(pageMembers, pageNum, totalPages) {
-    const W = 1040;
+  function drawYearlyReportPage(pageMembers, pageNum, totalPages, isLastPage) {
+    const W = 1090;
     const marginX = 24;
-    const nameColW = 130;
-    const monthColW = (W - marginX * 2 - nameColW) / 12;
+    const nameColW = 120;
+    const totalColW = 72;
+    const monthColW = (W - marginX * 2 - nameColW - totalColW) / 12;
     const rowH = 30;
     const topH = 210;
-    const bottomH = 90;
+    const totalsRowH = isLastPage ? 34 : 0;
+    const bottomH = 90 + totalsRowH;
     const H = topH + 26 + pageMembers.length * rowH + bottomH;
     const canvas = document.createElement("canvas");
     canvas.width = W; canvas.height = H;
@@ -667,23 +683,25 @@ function Maestro() {
     ctx.font = "600 15px Inter, sans-serif";
     ctx.fillText(`${group.name}`, W - marginX, 38);
     ctx.font = "400 13px Inter, sans-serif";
-    ctx.fillText(`Rangkuman ${selectedYear}`, W - marginX, 58);
+    ctx.fillText(`Laporan Tahunan ${selectedYear}`, W - marginX, 58);
     ctx.textAlign = "left";
 
     // Summary cards
+    const obLabel = group.openingBalanceNote ? `Saldo Awal (${group.openingBalanceNote})` : "Saldo Awal";
     const cards = [
-      ["Pemasukan", formatRupiah(yearlyIncomeTotal), "#16A34A"],
-      ["Pengeluaran", formatRupiah(yearlyExpenseTotal), "#DC2626"],
-      ["Saldo Kas", formatRupiah(cashBalance), "#4F46E5"],
+      [obLabel, formatRupiah(group.openingBalance), "#334155"],
+      ["Pemasukan Tahun Ini", formatRupiah(yearlyIncomeTotal), "#16A34A"],
+      ["Pengeluaran Tahun Ini", formatRupiah(yearlyExpenseTotal), "#DC2626"],
+      ["Saldo Kas Saat Ini", formatRupiah(cashBalance), "#4F46E5"],
     ];
-    const cw = (W - marginX * 2 - 8 * 2) / 3;
+    const cw = (W - marginX * 2 - 8 * 3) / 4;
     cards.forEach((c, i) => {
       const x = marginX + i * (cw + 8), y = 100;
       ctx.fillStyle = "#FFFFFF";
       roundRect(ctx, x, y, cw, 54, 10); ctx.fill();
-      ctx.fillStyle = "#94A3B8"; ctx.font = "600 10px Inter, sans-serif";
+      ctx.fillStyle = "#94A3B8"; ctx.font = "600 9px Inter, sans-serif";
       ctx.fillText(c[0].toUpperCase(), x + 10, y + 18);
-      ctx.fillStyle = c[2]; ctx.font = "700 16px 'Plus Jakarta Sans', sans-serif";
+      ctx.fillStyle = c[2]; ctx.font = "700 14px 'Plus Jakarta Sans', sans-serif";
       ctx.fillText(c[1], x + 10, y + 40);
     });
 
@@ -697,40 +715,62 @@ function Maestro() {
       ctx.fillText(b, cx, y);
       ctx.textAlign = "left";
     });
+    ctx.textAlign = "center";
+    ctx.fillText("Total", marginX + nameColW + 12 * monthColW + totalColW / 2, y);
+    ctx.textAlign = "left";
     y += 10;
     ctx.strokeStyle = "#E2E8F0"; ctx.beginPath(); ctx.moveTo(marginX, y); ctx.lineTo(W - marginX, y); ctx.stroke();
-
-    const cellStyle = {
-      paid: { bg: "#DCFCE7", fg: "#15803D", label: "Lunas" },
-      unpaid: { bg: "#FEE2E2", fg: "#B91C1C", label: "Belum" },
-      leave: { bg: "#FEF3C7", fg: "#B45309", label: "Cuti" },
-    };
 
     pageMembers.forEach((m, idx) => {
       const ry = y + 22 + idx * rowH;
       ctx.fillStyle = "#334155"; ctx.font = "600 12px Inter, sans-serif";
-      ctx.fillText(m.nama.length > 16 ? m.nama.slice(0, 15) + "…" : m.nama, marginX, ry);
-      m.months.forEach((status, i) => {
-        const st = cellStyle[status];
+      ctx.fillText(m.nama.length > 15 ? m.nama.slice(0, 14) + "…" : m.nama, marginX, ry);
+      m.months.forEach((cell, i) => {
+        const st = YEARLY_CELL_STYLE[cell.status];
+        const label = cell.status === "paid" ? formatRupiahCompact(cell.amount) : st.label;
         const cx = marginX + nameColW + i * monthColW + 4;
         const cellW = monthColW - 8;
         ctx.fillStyle = st.bg; roundRect(ctx, cx, ry - 14, cellW, 20, 6); ctx.fill();
         ctx.fillStyle = st.fg; ctx.font = "600 9px Inter, sans-serif";
         ctx.textAlign = "center";
-        ctx.fillText(st.label, cx + cellW / 2, ry);
+        ctx.fillText(label, cx + cellW / 2, ry);
         ctx.textAlign = "left";
       });
+      ctx.fillStyle = "#4F46E5"; ctx.font = "700 11px Inter, sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillText(formatRupiahCompact(m.total), marginX + nameColW + 12 * monthColW + totalColW / 2, ry);
+      ctx.textAlign = "left";
       ctx.strokeStyle = "#F1F5F9"; ctx.beginPath(); ctx.moveTo(marginX, ry + 8); ctx.lineTo(W - marginX, ry + 8); ctx.stroke();
     });
 
+    let fy = y + 22 + pageMembers.length * rowH;
+
+    // Totals row (per bulan) — hanya di halaman terakhir
+    if (isLastPage) {
+      ctx.strokeStyle = "#CBD5E1"; ctx.beginPath(); ctx.moveTo(marginX, fy - 20); ctx.lineTo(W - marginX, fy - 20); ctx.stroke();
+      ctx.fillStyle = "#1E293B"; ctx.font = "700 11px Inter, sans-serif";
+      ctx.fillText("Total Terkumpul", marginX, fy);
+      yearlyBreakdown.forEach((r, i) => {
+        const cx = marginX + nameColW + i * monthColW + monthColW / 2;
+        ctx.textAlign = "center";
+        ctx.fillText(formatRupiahCompact(r.income), cx, fy);
+        ctx.textAlign = "left";
+      });
+      ctx.fillStyle = "#4F46E5"; ctx.font = "700 11px Inter, sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillText(formatRupiahCompact(yearlyIncomeTotal), marginX + nameColW + 12 * monthColW + totalColW / 2, fy);
+      ctx.textAlign = "left";
+      fy += totalsRowH;
+    }
+
     // Footer
-    let fy = topH + 26 + pageMembers.length * rowH + 24;
-    ctx.strokeStyle = "#CBD5E1"; ctx.beginPath(); ctx.moveTo(marginX, fy - 14); ctx.lineTo(W - marginX, fy - 14); ctx.stroke();
+    ctx.strokeStyle = "#CBD5E1"; ctx.beginPath(); ctx.moveTo(marginX, fy - 4); ctx.lineTo(W - marginX, fy - 4); ctx.stroke();
+    fy += 16;
     ctx.font = "400 10px Inter, sans-serif"; ctx.fillStyle = "#94A3B8";
-    ctx.fillText("Lunas = sudah bayar · Belum = belum bayar · Cuti = Vacation", marginX, fy); fy += 16;
+    ctx.fillText("Lunas = nominal dibayar · Belum = belum bayar · Cuti = Vacation", marginX, fy); fy += 16;
     ctx.fillText(`Dibuat ${new Date().toLocaleString("id-ID")} — Hal ${pageNum}/${totalPages}`, marginX, fy);
 
-    const filename = `maestro-rangkuman-${selectedGroup}-${selectedYear}-hal${pageNum}.png`;
+    const filename = `maestro-laporan-tahunan-${selectedGroup}-${selectedYear}-hal${pageNum}.png`;
     const dataUrl = canvas.toDataURL("image/png");
     setExportLinks((prev) => [{ id: uid("png"), kind: "png", filename, url: dataUrl, page: pageNum, totalPages }, ...prev]);
   }
@@ -1176,6 +1216,7 @@ function Maestro() {
                     value={formatRupiah(group.openingBalance)} color="#334155" />
                   <ReportRow label="Total Pemasukan Tahun Ini" value={formatRupiah(yearlyIncomeTotal)} color="#16A34A" />
                   <ReportRow label="Total Pengeluaran Tahun Ini" value={formatRupiah(yearlyExpenseTotal)} color="#DC2626" />
+                  <ReportRow label="Saldo Kas Saat Ini" value={formatRupiah(cashBalance)} color="#4F46E5" bold />
                 </div>
 
                 {memberYearlyMatrix.length === 0 ? (
@@ -1188,34 +1229,41 @@ function Maestro() {
                         {BULAN.map((b) => (
                           <th key={b} className="py-1.5 px-1 font-semibold" style={{ color: "#94A3B8", minWidth: 46 }}>{b}</th>
                         ))}
+                        <th className="py-1.5 px-1 font-semibold" style={{ color: "#4F46E5", minWidth: 56 }}>Total</th>
                       </tr>
                     </thead>
                     <tbody>
                       {memberYearlyMatrix.map((m) => (
                         <tr key={m.id} className="border-t" style={{ borderColor: "#F1F5F9" }}>
                           <td className="py-1.5 pr-2 font-medium sticky left-0 bg-white whitespace-nowrap">{m.nama}</td>
-                          {m.months.map((status, i) => (
+                          {m.months.map((cell, i) => (
                             <td key={i} className="px-1 py-1.5 text-center">
-                              <span className="inline-block rounded-md px-1.5 py-0.5 font-semibold" style={{ background: YEARLY_CELL_STYLE[status].bg, color: YEARLY_CELL_STYLE[status].fg }}>
-                                {YEARLY_CELL_STYLE[status].label}
+                              <span className="inline-block rounded-md px-1.5 py-0.5 font-semibold whitespace-nowrap" style={{ background: YEARLY_CELL_STYLE[cell.status].bg, color: YEARLY_CELL_STYLE[cell.status].fg }}>
+                                {cell.status === "paid" ? formatRupiahCompact(cell.amount) : YEARLY_CELL_STYLE[cell.status].label}
                               </span>
                             </td>
                           ))}
+                          <td className="px-1 py-1.5 text-center font-bold whitespace-nowrap" style={{ color: "#4F46E5" }}>{formatRupiahCompact(m.total)}</td>
                         </tr>
                       ))}
                     </tbody>
+                    <tfoot>
+                      <tr className="border-t-2" style={{ borderColor: "#E2E8F0" }}>
+                        <td className="py-2 pr-2 font-bold sticky left-0 bg-white whitespace-nowrap">Total Terkumpul</td>
+                        {yearlyBreakdown.map((r) => (
+                          <td key={r.label} className="px-1 py-2 text-center font-semibold whitespace-nowrap" style={{ color: "#16A34A" }}>{formatRupiahCompact(r.income)}</td>
+                        ))}
+                        <td className="px-1 py-2 text-center font-bold whitespace-nowrap" style={{ color: "#4F46E5" }}>{formatRupiahCompact(yearlyIncomeTotal)}</td>
+                      </tr>
+                    </tfoot>
                   </table>
                 )}
-                <p className="text-xs mt-2" style={{ color: "#CBD5E1" }}>Lunas = sudah bayar · Belum = belum bayar · Cuti = Vacation</p>
+                <p className="text-xs mt-2" style={{ color: "#CBD5E1" }}>Angka di sel = nominal sudah bayar · Belum = belum bayar · Cuti = Vacation · Total = akumulasi setahun</p>
 
                 <button onClick={handleDownloadYearlyPNG}
                   className="w-full flex items-center justify-center gap-1.5 py-2.5 rounded-xl text-sm font-semibold mt-3" style={{ background: "#F0FDF4", color: "#16A34A" }}>
                   ⬇️ Download PNG Laporan Tahunan
                 </button>
-
-                <div className="mt-3 pt-3 border-t" style={{ borderColor: "#E2E8F0" }}>
-                  <ReportRow label="Saldo Kas Saat Ini" value={formatRupiah(cashBalance)} color="#4F46E5" bold />
-                </div>
               </div>
             )}
 
@@ -1322,7 +1370,17 @@ function Maestro() {
 
         {tab === "log" && (
           <div className="bg-white rounded-xl shadow-sm overflow-hidden">
-            <p className="text-xs font-semibold px-3.5 pt-3 pb-2" style={{ color: "#94A3B8" }}>LOG AKTIVITAS</p>
+            <div className="flex items-center justify-between px-3.5 pt-3 pb-2">
+              <div>
+                <p className="text-xs font-semibold" style={{ color: "#94A3B8" }}>LOG AKTIVITAS</p>
+                <p className="text-xs mt-0.5" style={{ color: "#CBD5E1" }}>{data.activityLog.length} / 300 entri (otomatis terpangkas kalau lebih)</p>
+              </div>
+              {data.activityLog.length > 0 && (
+                <button onClick={handleClearLog} className="text-xs font-semibold px-2.5 py-1.5 rounded-lg" style={{ background: "#FEF2F2", color: "#DC2626" }}>
+                  Hapus Semua
+                </button>
+              )}
+            </div>
             {data.activityLog.length === 0 ? (
               <p className="text-sm text-center py-8" style={{ color: "#CBD5E1" }}>Belum ada aktivitas</p>
             ) : (
