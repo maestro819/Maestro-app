@@ -27,6 +27,9 @@ const STORAGE_KEY = "maestro:data-v1";              // cache lokal (fallback off
 const SUPABASE_CONFIG_KEY = "maestro:supabase-config"; // simpan URL + anon key project supabase
 const SUPABASE_TABLE = "maestro_state";
 const SUPABASE_ROW_ID = "main";
+// Kredensial bawaan MAESTRO — semua device yang buka file ini otomatis konek ke project Supabase yang sama.
+const DEFAULT_SUPABASE_URL = "https://wztbmucqmuwxpnahladz.supabase.co";
+const DEFAULT_SUPABASE_KEY = "sb_publishable_8Dg5TjjJYDKmeiyPF2NN7A_2dF5VcUi";
 const BULAN = ["Jan", "Feb", "Mar", "Apr", "Mei", "Jun", "Jul", "Agu", "Sep", "Okt", "Nov", "Des"];
 const BULAN_FULL = ["Januari","Februari","Maret","April","Mei","Juni","Juli","Agustus","September","Oktober","November","Desember"];
 
@@ -72,6 +75,11 @@ const STATUS_STYLE = {
   unpaid: { label: "Unpaid", bg: "#FEE2E2", fg: "#B91C1C" },
   leave: { label: "Vacation", bg: "#FEF3C7", fg: "#B45309" },
 };
+const YEARLY_CELL_STYLE = {
+  paid: { bg: "#DCFCE7", fg: "#15803D", label: "Lunas" },
+  unpaid: { bg: "#FEE2E2", fg: "#B91C1C", label: "Belum" },
+  leave: { bg: "#FEF3C7", fg: "#B45309", label: "Cuti" },
+};
 
 function Maestro() {
   const [data, setData] = useState(emptyData);
@@ -87,7 +95,6 @@ function Maestro() {
   const [selectedMonth, setSelectedMonth] = useState(new Date().getMonth());
   const [selectedYear, setSelectedYear] = useState(new Date().getFullYear());
   const [tab, setTab] = useState("dashboard");
-  const [yearlyMode, setYearlyMode] = useState(false);
 
   const [memberModal, setMemberModal] = useState(null); // memberId
   const [customAmount, setCustomAmount] = useState("");
@@ -117,15 +124,20 @@ function Maestro() {
   const skipNextSaveRef = useRef(false);
   const lastSyncedRef = useRef(null); // JSON string of the payload currently in sync with Supabase
 
-  // Load supabase config saved on this device
+  // Load supabase config saved on this device (fallback ke kredensial bawaan MAESTRO)
   useEffect(() => {
     try {
       const raw = localStorage.getItem(SUPABASE_CONFIG_KEY);
       if (raw) {
         const cfg = JSON.parse(raw);
-        if (cfg && cfg.url && cfg.key) setSupaConfig(cfg);
+        if (cfg && cfg.url && cfg.key) { setSupaConfig(cfg); setSupaConfigChecked(true); return; }
       }
     } catch (e) { /* ignore */ }
+    if (DEFAULT_SUPABASE_URL && DEFAULT_SUPABASE_KEY) {
+      const cfg = { url: DEFAULT_SUPABASE_URL, key: DEFAULT_SUPABASE_KEY };
+      try { localStorage.setItem(SUPABASE_CONFIG_KEY, JSON.stringify(cfg)); } catch (e) { /* ignore */ }
+      setSupaConfig(cfg);
+    }
     setSupaConfigChecked(true);
   }, []);
 
@@ -915,87 +927,6 @@ function Maestro() {
 
   const modalMember = memberModal ? memberRows.find((m) => m.id === memberModal) : null;
 
-  // ---------- MODE RANGKUMAN TAHUNAN ----------
-  const YEARLY_CELL_STYLE = {
-    paid: { bg: "#DCFCE7", fg: "#15803D", label: "Lunas" },
-    unpaid: { bg: "#FEE2E2", fg: "#B91C1C", label: "Belum" },
-    leave: { bg: "#FEF3C7", fg: "#B45309", label: "Cuti" },
-  };
-
-  if (yearlyMode) {
-    return (
-      <div className="min-h-screen" style={{ background: "#F8FAFC", fontFamily: "'Inter',sans-serif" }}>
-        <button onClick={() => setYearlyMode(false)}
-          className="fixed top-3 right-3 z-50 bg-white shadow-md rounded-full p-2">
-          ✕
-        </button>
-        <div className="max-w-md mx-auto px-4 py-6">
-          <div className="rounded-2xl p-5 mb-4 text-white" style={{ background: "linear-gradient(135deg,#6366F1,#8B5CF6)" }}>
-            <h1 className="text-2xl font-extrabold" style={{ fontFamily: "'Plus Jakarta Sans',sans-serif" }}>{data.appName}</h1>
-            <p className="text-xs italic opacity-80 mb-3">{data.appTagline}</p>
-            <div className="flex items-center justify-between">
-              <p className="text-sm font-semibold">{group.name} — Rangkuman {selectedYear}</p>
-              <div className="flex items-center gap-1 rounded-lg px-1.5 py-1" style={{ background: "rgba(255,255,255,0.2)" }}>
-                <button onClick={() => setSelectedYear((y) => y - 1)}>‹</button>
-                <span className="text-sm font-medium px-1">{selectedYear}</span>
-                <button onClick={() => setSelectedYear((y) => y + 1)}>›</button>
-              </div>
-            </div>
-          </div>
-
-          <div className="grid grid-cols-3 gap-2 mb-4">
-            <SummaryCard label="Pemasukan" value={formatRupiah(yearlyIncomeTotal)} color="#16A34A" />
-            <SummaryCard label="Pengeluaran" value={formatRupiah(yearlyExpenseTotal)} color="#DC2626" />
-            <SummaryCard label="Saldo Kas" value={formatRupiah(cashBalance)} color="#4F46E5" />
-          </div>
-
-          <button onClick={handleDownloadYearlyPNG}
-            className="w-full flex items-center justify-center gap-1.5 py-2.5 rounded-xl text-sm font-semibold bg-white shadow-sm mb-4" style={{ color: "#16A34A" }}>
-            ⬇️ Download PNG Rangkuman {selectedYear}
-          </button>
-
-          <div className="bg-white rounded-xl shadow-sm p-3 mb-4 overflow-x-auto">
-            <p className="text-xs font-semibold mb-2" style={{ color: "#94A3B8" }}>DAFTAR ANGGOTA — {group.name}</p>
-            {memberYearlyMatrix.length === 0 ? (
-              <p className="text-xs py-4" style={{ color: "#CBD5E1" }}>Belum ada anggota</p>
-            ) : (
-              <table className="text-xs" style={{ borderCollapse: "collapse", minWidth: "100%" }}>
-                <thead>
-                  <tr>
-                    <th className="text-left py-1.5 pr-2 sticky left-0 bg-white" style={{ color: "#94A3B8" }}>Nama</th>
-                    {BULAN.map((b) => (
-                      <th key={b} className="py-1.5 px-1 font-semibold" style={{ color: "#94A3B8", minWidth: 46 }}>{b}</th>
-                    ))}
-                  </tr>
-                </thead>
-                <tbody>
-                  {memberYearlyMatrix.map((m) => (
-                    <tr key={m.id} className="border-t" style={{ borderColor: "#F1F5F9" }}>
-                      <td className="py-1.5 pr-2 font-medium sticky left-0 bg-white whitespace-nowrap">{m.nama}</td>
-                      {m.months.map((status, i) => (
-                        <td key={i} className="px-1 py-1.5 text-center">
-                          <span className="inline-block rounded-md px-1.5 py-0.5 font-semibold" style={{ background: YEARLY_CELL_STYLE[status].bg, color: YEARLY_CELL_STYLE[status].fg }}>
-                            {YEARLY_CELL_STYLE[status].label}
-                          </span>
-                        </td>
-                      ))}
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            )}
-            <p className="text-xs mt-2" style={{ color: "#CBD5E1" }}>Lunas = sudah bayar · Belum = belum bayar · Cuti = Vacation</p>
-          </div>
-
-          <div className="rounded-xl p-4 text-center text-white font-bold" style={{ background: "linear-gradient(135deg,#4F46E5,#8B5CF6)" }}>
-            Saldo Kas Saat Ini: {formatRupiah(cashBalance)}
-          </div>
-          <p className="text-xs text-center mt-2" style={{ color: "#CBD5E1" }}>Dibuat {new Date().toLocaleString("id-ID")}</p>
-        </div>
-      </div>
-    );
-  }
-
   // ---------- MAIN APP ----------
   return (
     <div className="min-h-screen pb-20" style={{ background: "#F1F5F9", fontFamily: "'Inter',sans-serif" }}>
@@ -1049,9 +980,9 @@ function Maestro() {
             </div>
 
             <div className="flex gap-2 mb-4">
-              <button onClick={() => setYearlyMode(true)}
+              <button onClick={() => { setTab("reports"); setReportView("yearly"); }}
                 className="flex-1 flex items-center justify-center gap-1.5 py-2.5 rounded-xl text-sm font-semibold bg-white shadow-sm" style={{ color: "#4F46E5" }}>
-                📅 Rangkuman Tahunan
+                📅 Laporan Tahunan
               </button>
               <button onClick={handleDownloadPNG}
                 className="flex-1 flex items-center justify-center gap-1.5 py-2.5 rounded-xl text-sm font-semibold bg-white shadow-sm" style={{ color: "#16A34A" }}>
@@ -1230,34 +1161,60 @@ function Maestro() {
 
             {reportView === "yearly" && (
               <div className="bg-white rounded-xl shadow-sm p-3.5 overflow-x-auto">
-                <p className="text-xs font-semibold mb-3" style={{ color: "#94A3B8" }}>LAPORAN TAHUNAN — {group.name} · {selectedYear}</p>
-                <div className="mb-3 pb-3 border-b" style={{ borderColor: "#E2E8F0" }}>
+                <div className="flex items-center justify-between mb-3">
+                  <p className="text-xs font-semibold" style={{ color: "#94A3B8" }}>LAPORAN TAHUNAN — {group.name} · {selectedYear}</p>
+                  <div className="flex items-center gap-1 rounded-lg px-1 py-0.5" style={{ background: "#F1F5F9" }}>
+                    <button onClick={() => setSelectedYear((y) => y - 1)} className="px-1.5 text-sm">‹</button>
+                    <span className="text-xs font-semibold px-1">{selectedYear}</span>
+                    <button onClick={() => setSelectedYear((y) => y + 1)} className="px-1.5 text-sm">›</button>
+                  </div>
+                </div>
+
+                <div className="mb-3 pb-3 border-b flex flex-col gap-1" style={{ borderColor: "#E2E8F0" }}>
                   <ReportRow
                     label={group.openingBalanceNote ? `Saldo Awal (${group.openingBalanceNote})` : "Saldo Awal"}
                     value={formatRupiah(group.openingBalance)} color="#334155" />
+                  <ReportRow label="Total Pemasukan Tahun Ini" value={formatRupiah(yearlyIncomeTotal)} color="#16A34A" />
+                  <ReportRow label="Total Pengeluaran Tahun Ini" value={formatRupiah(yearlyExpenseTotal)} color="#DC2626" />
                 </div>
-                <table className="w-full text-xs">
-                  <thead>
-                    <tr style={{ color: "#94A3B8" }}>
-                      <th className="text-left py-1">Bulan</th>
-                      <th className="text-right py-1">Masuk</th>
-                      <th className="text-right py-1">Keluar</th>
-                      <th className="text-right py-1">Net</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {yearlyBreakdown.map((r) => (
-                      <tr key={r.label} className="border-t" style={{ borderColor: "#F1F5F9" }}>
-                        <td className="py-1.5">{r.label}</td>
-                        <td className="py-1.5 text-right" style={{ color: "#16A34A" }}>{formatRupiah(r.income)}</td>
-                        <td className="py-1.5 text-right" style={{ color: "#DC2626" }}>{formatRupiah(r.expense)}</td>
-                        <td className="py-1.5 text-right font-semibold" style={{ color: r.net >= 0 ? "#334155" : "#DC2626" }}>{formatRupiah(r.net)}</td>
+
+                {memberYearlyMatrix.length === 0 ? (
+                  <p className="text-xs py-4 text-center" style={{ color: "#CBD5E1" }}>Belum ada anggota</p>
+                ) : (
+                  <table className="text-xs" style={{ borderCollapse: "collapse", minWidth: "100%" }}>
+                    <thead>
+                      <tr>
+                        <th className="text-left py-1.5 pr-2 sticky left-0 bg-white" style={{ color: "#94A3B8" }}>Nama</th>
+                        {BULAN.map((b) => (
+                          <th key={b} className="py-1.5 px-1 font-semibold" style={{ color: "#94A3B8", minWidth: 46 }}>{b}</th>
+                        ))}
                       </tr>
-                    ))}
-                  </tbody>
-                </table>
+                    </thead>
+                    <tbody>
+                      {memberYearlyMatrix.map((m) => (
+                        <tr key={m.id} className="border-t" style={{ borderColor: "#F1F5F9" }}>
+                          <td className="py-1.5 pr-2 font-medium sticky left-0 bg-white whitespace-nowrap">{m.nama}</td>
+                          {m.months.map((status, i) => (
+                            <td key={i} className="px-1 py-1.5 text-center">
+                              <span className="inline-block rounded-md px-1.5 py-0.5 font-semibold" style={{ background: YEARLY_CELL_STYLE[status].bg, color: YEARLY_CELL_STYLE[status].fg }}>
+                                {YEARLY_CELL_STYLE[status].label}
+                              </span>
+                            </td>
+                          ))}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                )}
+                <p className="text-xs mt-2" style={{ color: "#CBD5E1" }}>Lunas = sudah bayar · Belum = belum bayar · Cuti = Vacation</p>
+
+                <button onClick={handleDownloadYearlyPNG}
+                  className="w-full flex items-center justify-center gap-1.5 py-2.5 rounded-xl text-sm font-semibold mt-3" style={{ background: "#F0FDF4", color: "#16A34A" }}>
+                  ⬇️ Download PNG Laporan Tahunan
+                </button>
+
                 <div className="mt-3 pt-3 border-t" style={{ borderColor: "#E2E8F0" }}>
-                  <ReportRow label="Saldo Akhir Tahun" value={formatRupiah(cashBalance)} color="#4F46E5" bold />
+                  <ReportRow label="Saldo Kas Saat Ini" value={formatRupiah(cashBalance)} color="#4F46E5" bold />
                 </div>
               </div>
             )}
