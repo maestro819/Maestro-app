@@ -11,6 +11,7 @@
 <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
 <script src="https://unpkg.com/@babel/standalone/babel.min.js" crossorigin></script>
 <script src="https://unpkg.com/xlsx@0.18.5/dist/xlsx.full.min.js" crossorigin></script>
+<script src="https://unpkg.com/@supabase/supabase-js@2/dist/umd/supabase.js" crossorigin></script>
 <style>
   body { margin: 0; font-family: 'Inter', sans-serif; }
 </style>
@@ -22,10 +23,28 @@
 const { useState, useEffect, useMemo, useCallback, useRef } = React;
 
 
-const STORAGE_KEY = "maestro:data-v1";
+const STORAGE_KEY = "maestro:data-v1";              // cache lokal (fallback offline)
+const SUPABASE_CONFIG_KEY = "maestro:supabase-config"; // simpan URL + anon key project supabase
+const SUPABASE_TABLE = "maestro_state";
+const SUPABASE_ROW_ID = "main";
+// Kredensial bawaan MAESTRO — semua device yang buka file ini otomatis konek ke project Supabase yang sama.
+const DEFAULT_SUPABASE_URL = "https://wztbmucqmuwxpnahladz.supabase.co";
+const DEFAULT_SUPABASE_KEY = "sb_publishable_8Dg5TjjJYDKmeiyPF2NN7A_2dF5VcUi";
 const BULAN = ["Jan", "Feb", "Mar", "Apr", "Mei", "Jun", "Jul", "Agu", "Sep", "Okt", "Nov", "Des"];
 const BULAN_FULL = ["Januari","Februari","Maret","April","Mei","Juni","Juli","Agustus","September","Oktober","November","Desember"];
 
+
+const SETUP_SQL = `create table if not exists maestro_state (
+  id text primary key,
+  payload jsonb not null,
+  updated_at timestamptz not null default now()
+);
+
+alter table maestro_state enable row level security;
+
+create policy "maestro allow all"
+on maestro_state for all
+using (true) with check (true);`;
 
 function uid(p) { return `${p}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`; }
 function formatRupiah(n) {
@@ -56,6 +75,11 @@ const STATUS_STYLE = {
   unpaid: { label: "Unpaid", bg: "#FEE2E2", fg: "#B91C1C" },
   leave: { label: "Vacation", bg: "#FEF3C7", fg: "#B45309" },
 };
+const YEARLY_CELL_STYLE = {
+  paid: { bg: "#DCFCE7", fg: "#15803D", label: "Lunas" },
+  unpaid: { bg: "#FEE2E2", fg: "#B91C1C", label: "Belum" },
+  leave: { bg: "#FEF3C7", fg: "#B45309", label: "Cuti" },
+};
 
 function Maestro() {
   const [data, setData] = useState(emptyData);
@@ -71,7 +95,6 @@ function Maestro() {
   const [selectedMonth, setSelectedMonth] = useState(new Date().getMonth());
   const [selectedYear, setSelectedYear] = useState(new Date().getFullYear());
   const [tab, setTab] = useState("dashboard");
-  const [screenshotMode, setScreenshotMode] = useState(false);
 
   const [memberModal, setMemberModal] = useState(null); // memberId
   const [customAmount, setCustomAmount] = useState("");
@@ -88,21 +111,161 @@ function Maestro() {
   const [restoreMsg, setRestoreMsg] = useState("");
   const [exportLinks, setExportLinks] = useState([]);
 
+  // ---- Supabase config & client ----
+  const [supaConfig, setSupaConfig] = useState(null);       // { url, key } | null
+  const [supaConfigChecked, setSupaConfigChecked] = useState(false);
+  const [syncStatus, setSyncStatus] = useState("idle");     // idle | loading | saving | saved | error | offline
+  const [setupUrl, setSetupUrl] = useState("");
+  const [setupKey, setSetupKey] = useState("");
+  const [setupError, setSetupError] = useState("");
+  const [setupBusy, setSetupBusy] = useState(false);
+  const clientRef = useRef(null);
+  const saveTimerRef = useRef(null);
+  const skipNextSaveRef = useRef(false);
+  const lastSyncedRef = useRef(null); // JSON string of the payload currently in sync with Supabase
+
+  // Load supabase config saved on this device (fallback ke kredensial bawaan MAESTRO)
   useEffect(() => {
     try {
-      const raw = localStorage.getItem(STORAGE_KEY);
-      if (raw) setData({ ...emptyData, ...JSON.parse(raw) });
-    } catch (e) { /* first run or corrupted data */ }
-    finally { setLoaded(true); }
+      const raw = localStorage.getItem(SUPABASE_CONFIG_KEY);
+      if (raw) {
+        const cfg = JSON.parse(raw);
+        if (cfg && cfg.url && cfg.key) { setSupaConfig(cfg); setSupaConfigChecked(true); return; }
+      }
+    } catch (e) { /* ignore */ }
+    if (DEFAULT_SUPABASE_URL && DEFAULT_SUPABASE_KEY) {
+      const cfg = { url: DEFAULT_SUPABASE_URL, key: DEFAULT_SUPABASE_KEY };
+      try { localStorage.setItem(SUPABASE_CONFIG_KEY, JSON.stringify(cfg)); } catch (e) { /* ignore */ }
+      setSupaConfig(cfg);
+    }
+    setSupaConfigChecked(true);
   }, []);
 
+  // Once config is known, connect + load data from Supabase (with local cache fallback)
   useEffect(() => {
-    if (!loaded) return;
+    if (!supaConfigChecked) return;
+    if (!supaConfig) { setLoaded(true); return; }
+
+    let cancelled = false;
+    setSyncStatus("loading");
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
-      setSaveError(false);
-    } catch (e) { setSaveError(true); }
-  }, [data, loaded]);
+      clientRef.current = window.supabase.createClient(supaConfig.url, supaConfig.key);
+    } catch (e) {
+      setSyncStatus("error");
+      setLoaded(true);
+      return;
+    }
+    const client = clientRef.current;
+
+    (async () => {
+      try {
+        const { data: row, error } = await client
+          .from(SUPABASE_TABLE).select("payload").eq("id", SUPABASE_ROW_ID).maybeSingle();
+        if (error) throw error;
+        if (cancelled) return;
+
+        if (row && row.payload) {
+          const merged = { ...emptyData, ...row.payload };
+          lastSyncedRef.current = JSON.stringify(merged);
+          setData(merged);
+        } else {
+          // No row yet: migrate local cache (kalau ada data lama di HP ini) atau mulai kosong
+          let initial = emptyData;
+          try {
+            const raw = localStorage.getItem(STORAGE_KEY);
+            if (raw) initial = { ...emptyData, ...JSON.parse(raw) };
+          } catch (e2) { /* ignore */ }
+          const { error: insErr } = await client
+            .from(SUPABASE_TABLE)
+            .upsert({ id: SUPABASE_ROW_ID, payload: initial, updated_at: new Date().toISOString() });
+          if (insErr) throw insErr;
+          lastSyncedRef.current = JSON.stringify(initial);
+          setData(initial);
+        }
+        setSyncStatus("saved");
+      } catch (e) {
+        setSyncStatus("error");
+      } finally {
+        if (!cancelled) setLoaded(true);
+      }
+    })();
+
+    // Realtime: kalau device lain mengubah data, ikut update di sini
+    const channel = client
+      .channel("maestro_state_changes")
+      .on("postgres_changes", { event: "UPDATE", schema: "public", table: SUPABASE_TABLE, filter: `id=eq.${SUPABASE_ROW_ID}` },
+        (payload) => {
+          const incoming = payload.new && payload.new.payload;
+          if (!incoming) return;
+          const incomingStr = JSON.stringify(incoming);
+          if (incomingStr === lastSyncedRef.current) return; // perubahan dari device ini sendiri
+          skipNextSaveRef.current = true;
+          lastSyncedRef.current = incomingStr;
+          setData({ ...emptyData, ...incoming });
+        })
+      .subscribe();
+
+    return () => { cancelled = true; try { client.removeChannel(channel); } catch (e) { /* ignore */ } };
+  }, [supaConfig, supaConfigChecked]);
+
+  // Save to Supabase (debounced) whenever data changes
+  useEffect(() => {
+    if (!loaded || !supaConfig) return;
+    // Selalu simpan cache lokal sebagai cadangan offline
+    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(data)); } catch (e) { /* ignore */ }
+
+    if (skipNextSaveRef.current) { skipNextSaveRef.current = false; return; }
+    const payloadStr = JSON.stringify(data);
+    if (payloadStr === lastSyncedRef.current) return;
+
+    setSyncStatus("saving");
+    if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+    saveTimerRef.current = setTimeout(async () => {
+      try {
+        const client = clientRef.current;
+        if (!client) return;
+        const { error } = await client
+          .from(SUPABASE_TABLE)
+          .upsert({ id: SUPABASE_ROW_ID, payload: data, updated_at: new Date().toISOString() });
+        if (error) throw error;
+        lastSyncedRef.current = payloadStr;
+        setSyncStatus("saved");
+        setSaveError(false);
+      } catch (e) {
+        setSyncStatus("error");
+        setSaveError(true);
+      }
+    }, 800);
+    return () => { if (saveTimerRef.current) clearTimeout(saveTimerRef.current); };
+  }, [data, loaded, supaConfig]);
+
+  const handleSaveSetup = async () => {
+    setSetupError("");
+    const url = setupUrl.trim().replace(/\/+$/, "");
+    const key = setupKey.trim();
+    if (!url || !key) { setSetupError("URL dan anon key wajib diisi."); return; }
+    setSetupBusy(true);
+    try {
+      const testClient = window.supabase.createClient(url, key);
+      const { error } = await testClient.from(SUPABASE_TABLE).select("id").limit(1);
+      if (error && error.code !== "PGRST116") {
+        // PGRST116 = no rows, itu bukan masalah. Error lain berarti tabel/kredensial belum benar.
+        if (String(error.message || "").toLowerCase().includes("does not exist")) {
+          setSetupError('Tabel "maestro_state" belum ada. Jalankan dulu SQL di bawah ini di Supabase SQL Editor.');
+        } else {
+          setSetupError(`Gagal konek: ${error.message || "cek kembali URL & key"}`);
+        }
+        setSetupBusy(false);
+        return;
+      }
+      const cfg = { url, key };
+      localStorage.setItem(SUPABASE_CONFIG_KEY, JSON.stringify(cfg));
+      setSupaConfig(cfg);
+    } catch (e) {
+      setSetupError("Gagal konek ke Supabase. Cek kembali URL & anon key.");
+    }
+    setSetupBusy(false);
+  };
 
   const logActivity = useCallback((text) => {
     setData((d) => ({
@@ -188,6 +351,16 @@ function Maestro() {
     setMemberModal(null);
   };
 
+  const markUnpaid = (memberId, nama) => {
+    updateGroup((g) => {
+      const payments = { ...g.payments };
+      delete payments[payKey(memberId, selectedYear, selectedMonth)];
+      return { payments };
+    });
+    logActivity(`${nama} dibatalkan, kembali ke Unpaid (${BULAN_FULL[selectedMonth]} ${selectedYear})`);
+    setMemberModal(null); setUseCustom(false); setCustomAmount("");
+  };
+
   // ---- Expenses ----
   const addExpense = () => {
     const nom = parseFloat(String(expAmount).replace(/[^0-9.-]/g, ""));
@@ -230,6 +403,22 @@ function Maestro() {
       return { label, income, expense, net: income - expense };
     });
   }, [group, selectedYear]);
+
+  const memberYearlyMatrix = useMemo(() => {
+    return group.members.map((m) => ({
+      id: m.id,
+      nama: m.nama,
+      months: BULAN.map((_, month) => {
+        const p = group.payments[payKey(m.id, selectedYear, month)];
+        if (p && p.status === "paid") return "paid";
+        if (p && p.status === "leave") return "leave";
+        return "unpaid";
+      }),
+    }));
+  }, [group, selectedYear]);
+
+  const yearlyIncomeTotal = useMemo(() => yearlyBreakdown.reduce((s, r) => s + r.income, 0), [yearlyBreakdown]);
+  const yearlyExpenseTotal = useMemo(() => yearlyBreakdown.reduce((s, r) => s + r.expense, 0), [yearlyBreakdown]);
 
   const groupComparison = useMemo(() => {
     return ["A", "B"].map((gk) => {
@@ -438,6 +627,114 @@ function Maestro() {
     setExportLinks((prev) => [{ id: uid("png"), kind: "png", filename, url: dataUrl, page: pageNum, totalPages }, ...prev]);
   }
 
+  // ---- Yearly summary PNG export (matrix: Nama x 12 bulan, hanya keterangan status) ----
+  const handleDownloadYearlyPNG = () => {
+    const ROWS_PER_PAGE = 20;
+    const pages = Math.max(1, Math.ceil(memberYearlyMatrix.length / ROWS_PER_PAGE));
+    for (let p = 0; p < pages; p++) {
+      const pageMembers = memberYearlyMatrix.slice(p * ROWS_PER_PAGE, (p + 1) * ROWS_PER_PAGE);
+      drawYearlyReportPage(pageMembers, p + 1, pages);
+    }
+    logActivity(`PNG Rangkuman Tahunan ${group.name} ${selectedYear} dibuat (${pages} halaman)`);
+  };
+
+  function drawYearlyReportPage(pageMembers, pageNum, totalPages) {
+    const W = 1040;
+    const marginX = 24;
+    const nameColW = 130;
+    const monthColW = (W - marginX * 2 - nameColW) / 12;
+    const rowH = 30;
+    const topH = 210;
+    const bottomH = 90;
+    const H = topH + 26 + pageMembers.length * rowH + bottomH;
+    const canvas = document.createElement("canvas");
+    canvas.width = W; canvas.height = H;
+    const ctx = canvas.getContext("2d");
+
+    ctx.fillStyle = "#F8FAFC"; ctx.fillRect(0, 0, W, H);
+
+    // Header band
+    const grad = ctx.createLinearGradient(0, 0, W, 0);
+    grad.addColorStop(0, "#6366F1"); grad.addColorStop(1, "#8B5CF6");
+    ctx.fillStyle = grad; ctx.fillRect(0, 0, W, 86);
+    ctx.fillStyle = "#FFFFFF";
+    ctx.font = "700 26px 'Plus Jakarta Sans', sans-serif";
+    ctx.fillText(data.appName, marginX, 40);
+    ctx.font = "500 13px Inter, sans-serif";
+    ctx.fillStyle = "rgba(255,255,255,0.85)";
+    ctx.fillText(data.appTagline, marginX, 62);
+    ctx.textAlign = "right";
+    ctx.font = "600 15px Inter, sans-serif";
+    ctx.fillText(`${group.name}`, W - marginX, 38);
+    ctx.font = "400 13px Inter, sans-serif";
+    ctx.fillText(`Rangkuman ${selectedYear}`, W - marginX, 58);
+    ctx.textAlign = "left";
+
+    // Summary cards
+    const cards = [
+      ["Pemasukan", formatRupiah(yearlyIncomeTotal), "#16A34A"],
+      ["Pengeluaran", formatRupiah(yearlyExpenseTotal), "#DC2626"],
+      ["Saldo Kas", formatRupiah(cashBalance), "#4F46E5"],
+    ];
+    const cw = (W - marginX * 2 - 8 * 2) / 3;
+    cards.forEach((c, i) => {
+      const x = marginX + i * (cw + 8), y = 100;
+      ctx.fillStyle = "#FFFFFF";
+      roundRect(ctx, x, y, cw, 54, 10); ctx.fill();
+      ctx.fillStyle = "#94A3B8"; ctx.font = "600 10px Inter, sans-serif";
+      ctx.fillText(c[0].toUpperCase(), x + 10, y + 18);
+      ctx.fillStyle = c[2]; ctx.font = "700 16px 'Plus Jakarta Sans', sans-serif";
+      ctx.fillText(c[1], x + 10, y + 40);
+    });
+
+    // Table header
+    let y = topH;
+    ctx.fillStyle = "#1E293B"; ctx.font = "700 12px Inter, sans-serif";
+    ctx.fillText("Nama", marginX, y);
+    BULAN.forEach((b, i) => {
+      const cx = marginX + nameColW + i * monthColW + monthColW / 2;
+      ctx.textAlign = "center";
+      ctx.fillText(b, cx, y);
+      ctx.textAlign = "left";
+    });
+    y += 10;
+    ctx.strokeStyle = "#E2E8F0"; ctx.beginPath(); ctx.moveTo(marginX, y); ctx.lineTo(W - marginX, y); ctx.stroke();
+
+    const cellStyle = {
+      paid: { bg: "#DCFCE7", fg: "#15803D", label: "Lunas" },
+      unpaid: { bg: "#FEE2E2", fg: "#B91C1C", label: "Belum" },
+      leave: { bg: "#FEF3C7", fg: "#B45309", label: "Cuti" },
+    };
+
+    pageMembers.forEach((m, idx) => {
+      const ry = y + 22 + idx * rowH;
+      ctx.fillStyle = "#334155"; ctx.font = "600 12px Inter, sans-serif";
+      ctx.fillText(m.nama.length > 16 ? m.nama.slice(0, 15) + "…" : m.nama, marginX, ry);
+      m.months.forEach((status, i) => {
+        const st = cellStyle[status];
+        const cx = marginX + nameColW + i * monthColW + 4;
+        const cellW = monthColW - 8;
+        ctx.fillStyle = st.bg; roundRect(ctx, cx, ry - 14, cellW, 20, 6); ctx.fill();
+        ctx.fillStyle = st.fg; ctx.font = "600 9px Inter, sans-serif";
+        ctx.textAlign = "center";
+        ctx.fillText(st.label, cx + cellW / 2, ry);
+        ctx.textAlign = "left";
+      });
+      ctx.strokeStyle = "#F1F5F9"; ctx.beginPath(); ctx.moveTo(marginX, ry + 8); ctx.lineTo(W - marginX, ry + 8); ctx.stroke();
+    });
+
+    // Footer
+    let fy = topH + 26 + pageMembers.length * rowH + 24;
+    ctx.strokeStyle = "#CBD5E1"; ctx.beginPath(); ctx.moveTo(marginX, fy - 14); ctx.lineTo(W - marginX, fy - 14); ctx.stroke();
+    ctx.font = "400 10px Inter, sans-serif"; ctx.fillStyle = "#94A3B8";
+    ctx.fillText("Lunas = sudah bayar · Belum = belum bayar · Cuti = Vacation", marginX, fy); fy += 16;
+    ctx.fillText(`Dibuat ${new Date().toLocaleString("id-ID")} — Hal ${pageNum}/${totalPages}`, marginX, fy);
+
+    const filename = `maestro-rangkuman-${selectedGroup}-${selectedYear}-hal${pageNum}.png`;
+    const dataUrl = canvas.toDataURL("image/png");
+    setExportLinks((prev) => [{ id: uid("png"), kind: "png", filename, url: dataUrl, page: pageNum, totalPages }, ...prev]);
+  }
+
   // ---- Expense-only PNG export (all expenses, detail + akumulasi + sisa saldo) ----
   const handleDownloadExpensePNG = () => {
     const allExpenses = [...group.expenses].sort((a, b) => new Date(b.date) - new Date(a.date));
@@ -550,6 +847,53 @@ function Maestro() {
 
   // ================= RENDER =================
 
+  if (!supaConfigChecked) return null;
+
+  // ---- Setup Supabase (wajib sekali di awal per device/browser) ----
+  if (!supaConfig) {
+    return (
+      <div className="min-h-screen flex items-center justify-center px-5 py-8" style={{ background: "linear-gradient(135deg,#6366F1,#8B5CF6 50%,#EC4899)", fontFamily: "'Inter',sans-serif" }}>
+        <div className="bg-white rounded-2xl shadow-2xl p-6 w-full max-w-sm">
+          <h1 className="text-2xl font-extrabold mb-0.5" style={{ fontFamily: "'Plus Jakarta Sans',sans-serif", color: "#312E81" }}>Setup Supabase</h1>
+          <p className="text-xs mb-4" style={{ color: "#94A3B8" }}>Dilakukan sekali saja supaya data MAESTRO tersimpan di cloud dan sama di semua device.</p>
+
+          <div className="rounded-xl p-3 mb-4" style={{ background: "#EEF2FF" }}>
+            <p className="text-xs font-semibold mb-1" style={{ color: "#4F46E5" }}>Langkah-langkah:</p>
+            <ol className="text-xs list-decimal ml-4 space-y-1" style={{ color: "#4338CA" }}>
+              <li>Buat project gratis di supabase.com (kalau belum punya)</li>
+              <li>Buka SQL Editor di project itu, jalankan SQL di bawah ini</li>
+              <li>Buka Project Settings → API, salin "Project URL" dan "anon public key"</li>
+              <li>Tempel di bawah, lalu tekan Simpan &amp; Konek</li>
+            </ol>
+          </div>
+
+          <textarea readOnly value={SETUP_SQL} onClick={(e) => e.target.select()}
+            className="w-full text-xs font-mono rounded-lg p-2.5 mb-3" rows={7}
+            style={{ background: "#0F172A", color: "#A5B4FC", borderColor: "#0F172A" }} />
+          <p className="text-xs mb-4" style={{ color: "#94A3B8" }}>👆 Ketuk untuk pilih semua, lalu salin ke SQL Editor Supabase.</p>
+
+          <input value={setupUrl} onChange={(e) => setSetupUrl(e.target.value)} placeholder="Project URL (https://xxxx.supabase.co)"
+            className="w-full border rounded-xl px-3 py-2.5 text-sm outline-none mb-2" style={{ borderColor: "#E2E8F0" }} />
+          <input value={setupKey} onChange={(e) => setSetupKey(e.target.value)} placeholder="anon public key"
+            className="w-full border rounded-xl px-3 py-2.5 text-sm outline-none mb-2" style={{ borderColor: "#E2E8F0" }} />
+          {setupError && <p className="text-xs mb-2" style={{ color: "#DC2626" }}>{setupError}</p>}
+          <button onClick={handleSaveSetup} disabled={setupBusy} className="w-full py-3 rounded-xl text-white font-semibold text-sm mt-1"
+            style={{ background: "linear-gradient(135deg,#6366F1,#8B5CF6)", opacity: setupBusy ? 0.7 : 1 }}>
+            {setupBusy ? "Menghubungkan…" : "Simpan & Konek"}
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  if (!loaded) {
+    return (
+      <div className="min-h-screen flex items-center justify-center" style={{ background: "#F1F5F9", fontFamily: "'Inter',sans-serif" }}>
+        <p className="text-sm" style={{ color: "#64748B" }}>Memuat data…</p>
+      </div>
+    );
+  }
+
   if (!isLoggedIn) {
     return (
       <div
@@ -581,67 +925,7 @@ function Maestro() {
     );
   }
 
-  const modalMember = memberModal ? group.members.find((m) => m.id === memberModal) : null;
-
-  // ---------- SCREENSHOT MODE ----------
-  if (screenshotMode) {
-    return (
-      <div className="min-h-screen" style={{ background: "#F8FAFC", fontFamily: "'Inter',sans-serif" }}>
-        <button onClick={() => setScreenshotMode(false)}
-          className="fixed top-3 right-3 z-50 bg-white shadow-md rounded-full p-2">
-          ✕
-        </button>
-        <div className="max-w-md mx-auto px-4 py-6">
-          <div className="rounded-2xl p-5 mb-4 text-white" style={{ background: "linear-gradient(135deg,#6366F1,#8B5CF6)" }}>
-            <h1 className="text-2xl font-extrabold" style={{ fontFamily: "'Plus Jakarta Sans',sans-serif" }}>{data.appName}</h1>
-            <p className="text-xs italic opacity-80 mb-2">{data.appTagline}</p>
-            <p className="text-sm font-semibold">{group.name} — {BULAN_FULL[selectedMonth]} {selectedYear}</p>
-          </div>
-
-          <div className="rounded-lg px-3 py-2 mb-4 flex justify-between items-center" style={{ background: "#EEF2FF" }}>
-            <span className="text-xs font-medium" style={{ color: "#4F46E5" }}>
-              Saldo Awal{group.openingBalanceNote ? ` (${group.openingBalanceNote})` : ""}
-            </span>
-            <span className="text-xs font-bold" style={{ color: "#4F46E5" }}>{formatRupiah(group.openingBalance)}</span>
-          </div>
-
-          <div className="grid grid-cols-3 gap-2 mb-4">
-            <SummaryCard label="Saldo" value={formatRupiah(cashBalance)} color="#4F46E5" />
-            <SummaryCard label="Masuk" value={formatRupiah(monthlyIncome)} color="#16A34A" />
-            <SummaryCard label="Keluar" value={formatRupiah(monthlyExpenses)} color="#DC2626" />
-          </div>
-          <div className="grid grid-cols-3 gap-2 mb-5">
-            <SummaryCard label="Paid" value={paidCount} color="#16A34A" />
-            <SummaryCard label="Unpaid" value={unpaidCount} color="#DC2626" />
-            <SummaryCard label="Vacation" value={leaveCount} color="#D97706" />
-          </div>
-
-          <div className="bg-white rounded-xl shadow-sm p-3 mb-4">
-            <p className="text-xs font-semibold mb-2" style={{ color: "#94A3B8" }}>DAFTAR ANGGOTA</p>
-            {memberRows.map((m, i) => (
-              <MemberLine key={m.id} idx={i + 1} m={m} />
-            ))}
-          </div>
-
-          <div className="bg-white rounded-xl shadow-sm p-3 mb-4">
-            <p className="text-xs font-semibold mb-2" style={{ color: "#94A3B8" }}>PENGELUARAN</p>
-            {group.expenses.length === 0 ? (
-              <p className="text-xs" style={{ color: "#CBD5E1" }}>Tidak ada pengeluaran</p>
-            ) : group.expenses.map((e) => (
-              <div key={e.id} className="flex justify-between text-xs py-1">
-                <span>{e.description} <span style={{ color: "#94A3B8" }}>({formatDateID(e.date)})</span></span>
-                <span style={{ color: "#DC2626" }}>{formatRupiah(e.amount)}</span>
-              </div>
-            ))}
-          </div>
-
-          <div className="rounded-xl p-4 text-center text-white font-bold" style={{ background: "linear-gradient(135deg,#4F46E5,#8B5CF6)" }}>
-            Saldo Akhir: {formatRupiah(cashBalance)}
-          </div>
-        </div>
-      </div>
-    );
-  }
+  const modalMember = memberModal ? memberRows.find((m) => m.id === memberModal) : null;
 
   // ---------- MAIN APP ----------
   return (
@@ -651,7 +935,12 @@ function Maestro() {
         <div className="flex items-center justify-between mb-3">
           <div>
             <h1 className="text-xl font-extrabold leading-none" style={{ fontFamily: "'Plus Jakarta Sans',sans-serif" }}>{data.appName}</h1>
-            <p className="text-xs italic opacity-80">{data.appTagline}</p>
+            <p className="text-xs italic opacity-80 flex items-center gap-1">
+              {data.appTagline}
+              <span title={syncStatus === "error" ? "Gagal sinkron" : syncStatus === "saving" ? "Menyimpan…" : "Tersimpan di cloud"}>
+                {syncStatus === "saving" ? "🔄" : syncStatus === "error" ? "⚠️" : "☁️"}
+              </span>
+            </p>
           </div>
           <button onClick={() => setIsLoggedIn(false)} className="p-2 rounded-full" style={{ background: "rgba(255,255,255,0.2)" }}>🚪</button>
         </div>
@@ -691,9 +980,9 @@ function Maestro() {
             </div>
 
             <div className="flex gap-2 mb-4">
-              <button onClick={() => setScreenshotMode(true)}
+              <button onClick={() => { setTab("reports"); setReportView("yearly"); }}
                 className="flex-1 flex items-center justify-center gap-1.5 py-2.5 rounded-xl text-sm font-semibold bg-white shadow-sm" style={{ color: "#4F46E5" }}>
-                📷 Screenshot Mode
+                📅 Laporan Tahunan
               </button>
               <button onClick={handleDownloadPNG}
                 className="flex-1 flex items-center justify-center gap-1.5 py-2.5 rounded-xl text-sm font-semibold bg-white shadow-sm" style={{ color: "#16A34A" }}>
@@ -872,34 +1161,60 @@ function Maestro() {
 
             {reportView === "yearly" && (
               <div className="bg-white rounded-xl shadow-sm p-3.5 overflow-x-auto">
-                <p className="text-xs font-semibold mb-3" style={{ color: "#94A3B8" }}>LAPORAN TAHUNAN — {group.name} · {selectedYear}</p>
-                <div className="mb-3 pb-3 border-b" style={{ borderColor: "#E2E8F0" }}>
+                <div className="flex items-center justify-between mb-3">
+                  <p className="text-xs font-semibold" style={{ color: "#94A3B8" }}>LAPORAN TAHUNAN — {group.name} · {selectedYear}</p>
+                  <div className="flex items-center gap-1 rounded-lg px-1 py-0.5" style={{ background: "#F1F5F9" }}>
+                    <button onClick={() => setSelectedYear((y) => y - 1)} className="px-1.5 text-sm">‹</button>
+                    <span className="text-xs font-semibold px-1">{selectedYear}</span>
+                    <button onClick={() => setSelectedYear((y) => y + 1)} className="px-1.5 text-sm">›</button>
+                  </div>
+                </div>
+
+                <div className="mb-3 pb-3 border-b flex flex-col gap-1" style={{ borderColor: "#E2E8F0" }}>
                   <ReportRow
                     label={group.openingBalanceNote ? `Saldo Awal (${group.openingBalanceNote})` : "Saldo Awal"}
                     value={formatRupiah(group.openingBalance)} color="#334155" />
+                  <ReportRow label="Total Pemasukan Tahun Ini" value={formatRupiah(yearlyIncomeTotal)} color="#16A34A" />
+                  <ReportRow label="Total Pengeluaran Tahun Ini" value={formatRupiah(yearlyExpenseTotal)} color="#DC2626" />
                 </div>
-                <table className="w-full text-xs">
-                  <thead>
-                    <tr style={{ color: "#94A3B8" }}>
-                      <th className="text-left py-1">Bulan</th>
-                      <th className="text-right py-1">Masuk</th>
-                      <th className="text-right py-1">Keluar</th>
-                      <th className="text-right py-1">Net</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {yearlyBreakdown.map((r) => (
-                      <tr key={r.label} className="border-t" style={{ borderColor: "#F1F5F9" }}>
-                        <td className="py-1.5">{r.label}</td>
-                        <td className="py-1.5 text-right" style={{ color: "#16A34A" }}>{formatRupiah(r.income)}</td>
-                        <td className="py-1.5 text-right" style={{ color: "#DC2626" }}>{formatRupiah(r.expense)}</td>
-                        <td className="py-1.5 text-right font-semibold" style={{ color: r.net >= 0 ? "#334155" : "#DC2626" }}>{formatRupiah(r.net)}</td>
+
+                {memberYearlyMatrix.length === 0 ? (
+                  <p className="text-xs py-4 text-center" style={{ color: "#CBD5E1" }}>Belum ada anggota</p>
+                ) : (
+                  <table className="text-xs" style={{ borderCollapse: "collapse", minWidth: "100%" }}>
+                    <thead>
+                      <tr>
+                        <th className="text-left py-1.5 pr-2 sticky left-0 bg-white" style={{ color: "#94A3B8" }}>Nama</th>
+                        {BULAN.map((b) => (
+                          <th key={b} className="py-1.5 px-1 font-semibold" style={{ color: "#94A3B8", minWidth: 46 }}>{b}</th>
+                        ))}
                       </tr>
-                    ))}
-                  </tbody>
-                </table>
+                    </thead>
+                    <tbody>
+                      {memberYearlyMatrix.map((m) => (
+                        <tr key={m.id} className="border-t" style={{ borderColor: "#F1F5F9" }}>
+                          <td className="py-1.5 pr-2 font-medium sticky left-0 bg-white whitespace-nowrap">{m.nama}</td>
+                          {m.months.map((status, i) => (
+                            <td key={i} className="px-1 py-1.5 text-center">
+                              <span className="inline-block rounded-md px-1.5 py-0.5 font-semibold" style={{ background: YEARLY_CELL_STYLE[status].bg, color: YEARLY_CELL_STYLE[status].fg }}>
+                                {YEARLY_CELL_STYLE[status].label}
+                              </span>
+                            </td>
+                          ))}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                )}
+                <p className="text-xs mt-2" style={{ color: "#CBD5E1" }}>Lunas = sudah bayar · Belum = belum bayar · Cuti = Vacation</p>
+
+                <button onClick={handleDownloadYearlyPNG}
+                  className="w-full flex items-center justify-center gap-1.5 py-2.5 rounded-xl text-sm font-semibold mt-3" style={{ background: "#F0FDF4", color: "#16A34A" }}>
+                  ⬇️ Download PNG Laporan Tahunan
+                </button>
+
                 <div className="mt-3 pt-3 border-t" style={{ borderColor: "#E2E8F0" }}>
-                  <ReportRow label="Saldo Akhir Tahun" value={formatRupiah(cashBalance)} color="#4F46E5" bold />
+                  <ReportRow label="Saldo Kas Saat Ini" value={formatRupiah(cashBalance)} color="#4F46E5" bold />
                 </div>
               </div>
             )}
@@ -958,6 +1273,25 @@ function Maestro() {
             </div>
 
             <div className="bg-white rounded-xl shadow-sm p-3.5">
+              <p className="text-xs font-semibold mb-2" style={{ color: "#94A3B8" }}>PENYIMPANAN CLOUD (SUPABASE)</p>
+              <p className="text-xs mb-2" style={{ color: "#64748B" }}>
+                Status: <span style={{ fontWeight: 600, color: syncStatus === "error" ? "#DC2626" : "#16A34A" }}>
+                  {syncStatus === "error" ? "Gagal sinkron" : syncStatus === "saving" ? "Menyimpan…" : "Tersambung"}
+                </span>
+              </p>
+              <p className="text-xs mb-3 break-all" style={{ color: "#94A3B8" }}>{supaConfig ? supaConfig.url : "-"}</p>
+              <button onClick={() => {
+                  if (confirm("Putuskan koneksi Supabase di device ini? Kamu perlu masukkan URL & key lagi untuk lanjut pakai aplikasi.")) {
+                    localStorage.removeItem(SUPABASE_CONFIG_KEY);
+                    setSupaConfig(null);
+                  }
+                }}
+                className="w-full py-2.5 rounded-lg text-sm font-semibold" style={{ background: "#FEF2F2", color: "#DC2626" }}>
+                Putuskan / Ganti Koneksi Supabase
+              </button>
+            </div>
+
+            <div className="bg-white rounded-xl shadow-sm p-3.5">
               <p className="text-xs font-semibold mb-2" style={{ color: "#94A3B8" }}>AKUN LOGIN</p>
               <label className="text-xs" style={{ color: "#94A3B8" }}>Username</label>
               <input value={data.auth.username} onChange={(e) => setData((d) => ({ ...d, auth: { ...d.auth, username: e.target.value } }))}
@@ -1006,7 +1340,8 @@ function Maestro() {
           </div>
         )}
 
-        {saveError && <p className="text-xs mt-3 text-center" style={{ color: "#DC2626" }}>Gagal menyimpan otomatis.</p>}
+        {syncStatus === "saving" && <p className="text-xs mt-3 text-center" style={{ color: "#94A3B8" }}>Menyimpan ke cloud…</p>}
+        {syncStatus === "error" && <p className="text-xs mt-3 text-center" style={{ color: "#DC2626" }}>Gagal sinkron ke Supabase. Data tetap tersimpan di HP ini, akan dicoba lagi otomatis.</p>}
       </div>
 
       {/* Bottom nav */}
@@ -1034,35 +1369,75 @@ function Maestro() {
               <h3 className="text-base font-bold" style={{ fontFamily: "'Plus Jakarta Sans',sans-serif" }}>{modalMember.nama}</h3>
               <button onClick={() => setMemberModal(null)}>✕</button>
             </div>
-            <p className="text-xs mb-4" style={{ color: "#94A3B8" }}>{BULAN_FULL[selectedMonth]} {selectedYear} · {group.name}</p>
+            <p className="text-xs mb-3" style={{ color: "#94A3B8" }}>{BULAN_FULL[selectedMonth]} {selectedYear} · {group.name}</p>
 
-            <button onClick={() => markPaid(modalMember.id, modalMember.nama, group.defaultAmount)}
-              className="w-full py-3 rounded-xl text-sm font-semibold mb-2 text-white" style={{ background: "#16A34A" }}>
-              ✓ Tandai Lunas — {formatRupiah(group.defaultAmount)}
-            </button>
-
-            {!useCustom ? (
-              <button onClick={() => setUseCustom(true)} className="w-full py-2.5 rounded-xl text-sm font-medium mb-2 border" style={{ borderColor: "#E2E8F0", color: "#4F46E5" }}>
-                Gunakan Nominal Custom
-              </button>
-            ) : (
-              <div className="flex gap-2 mb-2">
-                <input value={customAmount} onChange={(e) => setCustomAmount(e.target.value)} placeholder="Nominal custom" inputMode="numeric"
-                  className="flex-1 border rounded-xl px-3 py-2.5 text-sm outline-none" style={{ borderColor: "#E2E8F0" }} />
-                <button onClick={() => {
-                    const n = parseFloat(String(customAmount).replace(/[^0-9.-]/g, ""));
-                    if (n > 0) markPaid(modalMember.id, modalMember.nama, n);
-                  }}
-                  className="px-4 rounded-xl text-white text-sm font-semibold" style={{ background: "#4F46E5" }}>
-                  Simpan
-                </button>
+            {modalMember.status !== "unpaid" && (
+              <div className="rounded-xl p-3 mb-3 flex items-center justify-between" style={{ background: STATUS_STYLE[modalMember.status].bg }}>
+                <div>
+                  <p className="text-xs font-semibold" style={{ color: STATUS_STYLE[modalMember.status].fg }}>
+                    Status saat ini: {STATUS_STYLE[modalMember.status].label}
+                  </p>
+                  {modalMember.status === "paid" && (
+                    <p className="text-xs mt-0.5" style={{ color: STATUS_STYLE[modalMember.status].fg }}>
+                      {formatRupiah(modalMember.amount)} · {formatDateID(modalMember.paymentDate)}
+                    </p>
+                  )}
+                </div>
               </div>
             )}
 
-            <button onClick={() => markLeave(modalMember.id, modalMember.nama)}
-              className="w-full py-2.5 rounded-xl text-sm font-semibold" style={{ background: "#FEF3C7", color: "#B45309" }}>
-              Tandai Vacation
-            </button>
+            {modalMember.status === "unpaid" ? (
+              <>
+                <button onClick={() => markPaid(modalMember.id, modalMember.nama, group.defaultAmount)}
+                  className="w-full py-3 rounded-xl text-sm font-semibold mb-2 text-white" style={{ background: "#16A34A" }}>
+                  ✓ Tandai Lunas — {formatRupiah(group.defaultAmount)}
+                </button>
+
+                {!useCustom ? (
+                  <button onClick={() => setUseCustom(true)} className="w-full py-2.5 rounded-xl text-sm font-medium mb-2 border" style={{ borderColor: "#E2E8F0", color: "#4F46E5" }}>
+                    Gunakan Nominal Custom
+                  </button>
+                ) : (
+                  <div className="flex gap-2 mb-2">
+                    <input value={customAmount} onChange={(e) => setCustomAmount(e.target.value)} placeholder="Nominal custom" inputMode="numeric"
+                      className="flex-1 border rounded-xl px-3 py-2.5 text-sm outline-none" style={{ borderColor: "#E2E8F0" }} />
+                    <button onClick={() => {
+                        const n = parseFloat(String(customAmount).replace(/[^0-9.-]/g, ""));
+                        if (n > 0) markPaid(modalMember.id, modalMember.nama, n);
+                      }}
+                      className="px-4 rounded-xl text-white text-sm font-semibold" style={{ background: "#4F46E5" }}>
+                      Simpan
+                    </button>
+                  </div>
+                )}
+
+                <button onClick={() => markLeave(modalMember.id, modalMember.nama)}
+                  className="w-full py-2.5 rounded-xl text-sm font-semibold" style={{ background: "#FEF3C7", color: "#B45309" }}>
+                  Tandai Vacation
+                </button>
+              </>
+            ) : (
+              <>
+                <button onClick={() => markUnpaid(modalMember.id, modalMember.nama)}
+                  className="w-full py-3 rounded-xl text-sm font-semibold mb-2 text-white" style={{ background: "#DC2626" }}>
+                  ↺ Batalkan — jadi Unpaid
+                </button>
+                <p className="text-xs text-center mb-2" style={{ color: "#CBD5E1" }}>Salah pencet? Klik tombol di atas untuk membatalkan, lalu tandai ulang dengan benar.</p>
+
+                {modalMember.status === "leave" && (
+                  <button onClick={() => markPaid(modalMember.id, modalMember.nama, group.defaultAmount)}
+                    className="w-full py-2.5 rounded-xl text-sm font-semibold" style={{ background: "#DCFCE7", color: "#15803D" }}>
+                    Ubah jadi Lunas — {formatRupiah(group.defaultAmount)}
+                  </button>
+                )}
+                {modalMember.status === "paid" && (
+                  <button onClick={() => markLeave(modalMember.id, modalMember.nama)}
+                    className="w-full py-2.5 rounded-xl text-sm font-semibold" style={{ background: "#FEF3C7", color: "#B45309" }}>
+                    Ubah jadi Vacation
+                  </button>
+                )}
+              </>
+            )}
           </div>
         </div>
       )}
