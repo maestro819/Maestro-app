@@ -4,6 +4,16 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1" />
 <title>MAESTRO</title>
+<meta name="description" content="Aplikasi pencatatan iuran & kas kelompok, online dan offline." />
+<link rel="manifest" href="manifest.webmanifest" />
+<meta name="theme-color" content="#6366F1" />
+<meta name="background-color" content="#F1F5F9" />
+<link rel="icon" href="icons/icon-192.png" type="image/png" />
+<link rel="apple-touch-icon" href="icons/icon-180.png" />
+<meta name="mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="apple-mobile-web-app-title" content="MAESTRO" />
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@500;600;700;800&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <script src="https://cdn.tailwindcss.com"></script>
@@ -200,7 +210,18 @@ function Maestro() {
         }
         setSyncStatus("saved");
       } catch (e) {
-        setSyncStatus("error");
+        // Gagal ambil data dari Supabase (mis. sedang offline). JANGAN mulai dari kosong —
+        // pakai cache lokal di HP ini supaya data yang sudah ada tetap tampil & aman.
+        setSyncStatus(navigator.onLine ? "error" : "offline");
+        try {
+          const raw = localStorage.getItem(STORAGE_KEY);
+          if (raw) {
+            const cached = { ...emptyData, ...JSON.parse(raw) };
+            if (!cancelled) setData(cached);
+            // lastSyncedRef sengaja dibiarkan kosong, supaya begitu online lagi
+            // versi di HP ini otomatis dinaikkan ke cloud.
+          }
+        } catch (e2) { /* ignore */ }
       } finally {
         if (!cancelled) setLoaded(true);
       }
@@ -224,36 +245,62 @@ function Maestro() {
     return () => { cancelled = true; try { client.removeChannel(channel); } catch (e) { /* ignore */ } };
   }, [supaConfig, supaConfigChecked]);
 
-  // Save to Supabase (debounced) whenever data changes
+  // ---- Online/offline awareness ----
+  const [isOnline, setIsOnline] = useState(typeof navigator === "undefined" ? true : navigator.onLine);
+  useEffect(() => {
+    const goOnline = () => { setIsOnline(true); attemptSyncRef.current && attemptSyncRef.current(); };
+    const goOffline = () => { setIsOnline(false); setSyncStatus("offline"); };
+    window.addEventListener("online", goOnline);
+    window.addEventListener("offline", goOffline);
+    return () => { window.removeEventListener("online", goOnline); window.removeEventListener("offline", goOffline); };
+  }, []);
+
+  const attemptSyncRef = useRef(null);
+  const retryTimerRef = useRef(null);
+
+  // Save to Supabase (debounced) whenever data changes — with automatic retry while offline.
   useEffect(() => {
     if (!loaded || !supaConfig) return;
-    // Selalu simpan cache lokal sebagai cadangan offline
+    // Selalu simpan cache lokal dulu — ini yang membuat data TIDAK PERNAH hilang,
+    // baik saat online maupun offline, walau sinkron ke cloud belum/gagal terjadi.
     try { localStorage.setItem(STORAGE_KEY, JSON.stringify(data)); } catch (e) { /* ignore */ }
 
     if (skipNextSaveRef.current) { skipNextSaveRef.current = false; return; }
     const payloadStr = JSON.stringify(data);
     if (payloadStr === lastSyncedRef.current) return;
 
-    setSyncStatus("saving");
-    if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
-    saveTimerRef.current = setTimeout(async () => {
+    const doSync = async (payload, payloadSnapshot) => {
+      if (!navigator.onLine) { setSyncStatus("offline"); return; }
+      setSyncStatus("saving");
       try {
         const client = clientRef.current;
         if (!client) return;
         const { error } = await client
           .from(SUPABASE_TABLE)
-          .upsert({ id: SUPABASE_ROW_ID, payload: data, updated_at: new Date().toISOString() });
+          .upsert({ id: SUPABASE_ROW_ID, payload, updated_at: new Date().toISOString() });
         if (error) throw error;
-        lastSyncedRef.current = payloadStr;
+        lastSyncedRef.current = payloadSnapshot;
         setSyncStatus("saved");
         setSaveError(false);
+        if (retryTimerRef.current) { clearInterval(retryTimerRef.current); retryTimerRef.current = null; }
       } catch (e) {
-        setSyncStatus("error");
+        setSyncStatus(navigator.onLine ? "error" : "offline");
         setSaveError(true);
+        // Terus coba lagi tiap 10 detik sampai berhasil (misalnya sinyal balik lagi)
+        if (!retryTimerRef.current) {
+          retryTimerRef.current = setInterval(() => attemptSyncRef.current && attemptSyncRef.current(), 10000);
+        }
       }
-    }, 800);
+    };
+
+    attemptSyncRef.current = () => doSync(data, payloadStr);
+
+    if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+    saveTimerRef.current = setTimeout(() => doSync(data, payloadStr), 800);
     return () => { if (saveTimerRef.current) clearTimeout(saveTimerRef.current); };
   }, [data, loaded, supaConfig]);
+
+  useEffect(() => () => { if (retryTimerRef.current) clearInterval(retryTimerRef.current); }, []);
 
   const handleSaveSetup = async () => {
     setSetupError("");
@@ -1157,8 +1204,12 @@ function Maestro() {
             <h1 className="text-2xl font-extrabold leading-none" style={{ fontFamily: "'Plus Jakarta Sans',sans-serif" }}>{data.appName}</h1>
             <p className="text-xs italic opacity-80 flex items-center gap-1 mt-1">
               {data.appTagline}
-              <span title={syncStatus === "error" ? "Gagal sinkron" : syncStatus === "saving" ? "Menyimpan…" : "Tersimpan di cloud"}>
-                {syncStatus === "saving" ? "🔄" : syncStatus === "error" ? "⚠️" : "☁️"}
+              <span title={
+                syncStatus === "offline" ? "Mode offline — data aman di HP, akan sinkron otomatis saat online"
+                : syncStatus === "error" ? "Gagal sinkron, dicoba lagi otomatis"
+                : syncStatus === "saving" ? "Menyimpan…" : "Tersimpan di cloud"
+              }>
+                {syncStatus === "offline" ? "📴" : syncStatus === "saving" ? "🔄" : syncStatus === "error" ? "⚠️" : "☁️"}
               </span>
             </p>
           </div>
@@ -1401,8 +1452,8 @@ function Maestro() {
             <div className="bg-white rounded-xl shadow-sm p-3.5">
               <p className="text-xs font-semibold mb-2" style={{ color: "#94A3B8" }}>PENYIMPANAN CLOUD (SUPABASE)</p>
               <p className="text-xs mb-2" style={{ color: "#64748B" }}>
-                Status: <span style={{ fontWeight: 600, color: syncStatus === "error" ? "#DC2626" : "#16A34A" }}>
-                  {syncStatus === "error" ? "Gagal sinkron" : syncStatus === "saving" ? "Menyimpan…" : "Tersambung"}
+                Status: <span style={{ fontWeight: 600, color: syncStatus === "error" ? "#DC2626" : syncStatus === "offline" ? "#B45309" : "#16A34A" }}>
+                  {syncStatus === "offline" ? "Offline (data aman di HP)" : syncStatus === "error" ? "Gagal sinkron" : syncStatus === "saving" ? "Menyimpan…" : "Tersambung"}
                 </span>
               </p>
               <p className="text-xs mb-3 break-all" style={{ color: "#94A3B8" }}>{supaConfig ? supaConfig.url : "-"}</p>
@@ -1433,6 +1484,7 @@ function Maestro() {
 
         {syncStatus === "saving" && <p className="text-xs mt-3 text-center" style={{ color: "#94A3B8" }}>Menyimpan ke cloud…</p>}
         {syncStatus === "error" && <p className="text-xs mt-3 text-center" style={{ color: "#DC2626" }}>Gagal sinkron ke Supabase. Data tetap tersimpan di HP ini, akan dicoba lagi otomatis.</p>}
+        {syncStatus === "offline" && <p className="text-xs mt-3 text-center" style={{ color: "#B45309" }}>Tidak ada koneksi internet. Semua perubahan tetap tersimpan di HP ini dan akan otomatis naik ke cloud begitu online lagi.</p>}
       </div>
 
       {/* Bottom nav */}
@@ -1620,6 +1672,16 @@ function MemberLine({ idx, m }) {
 
 const root = ReactDOM.createRoot(document.getElementById("root"));
 root.render(<Maestro />);
+</script>
+
+<script>
+  // Daftarkan service worker supaya app shell (HTML/JS/CSS/font) tersimpan di HP
+  // dan aplikasi tetap bisa dibuka walau tidak ada internet.
+  if ("serviceWorker" in navigator) {
+    window.addEventListener("load", () => {
+      navigator.serviceWorker.register("service-worker.js").catch(() => { /* ignore */ });
+    });
+  }
 </script>
 </body>
 </html>
