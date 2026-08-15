@@ -1,0 +1,1735 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1" />
+<title>MAESTRO</title>
+<meta name="description" content="Aplikasi pencatatan iuran & kas kelompok, online dan offline." />
+<link rel="manifest" href="manifest.webmanifest" />
+<meta name="theme-color" content="#6366F1" />
+<meta name="background-color" content="#F1F5F9" />
+<link rel="icon" href="Icons/icon-192.png" type="image/png" />
+<link rel="apple-touch-icon" href="Icons/icon-180.png" />
+<meta name="mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="apple-mobile-web-app-title" content="MAESTRO" />
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@500;600;700;800&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js" crossorigin></script>
+<script src="https://cdn.jsdelivr.net/npm/xlsx-js-style@1.2.0/dist/xlsx.bundle.js" crossorigin></script>
+<script src="https://unpkg.com/@supabase/supabase-js@2/dist/umd/supabase.js" crossorigin></script>
+<style>
+  body { margin: 0; font-family: 'Inter', sans-serif; background:#F1F5F9; }
+  button { -webkit-tap-highlight-color: transparent; }
+  .maestro-section-title { font-family:'Plus Jakarta Sans',sans-serif; letter-spacing:-0.01em; }
+  .maestro-quick-btn { transition: transform .15s ease, box-shadow .15s ease; }
+  .maestro-quick-btn:active { transform: scale(.98); }
+  .maestro-nav-safe { padding-bottom: calc(78px + env(safe-area-inset-bottom)); }
+  .maestro-bottom-nav { padding-bottom: env(safe-area-inset-bottom); }
+
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel">
+const { useState, useEffect, useMemo, useCallback, useRef } = React;
+
+
+const STORAGE_KEY = "maestro:data-v1";              // cache lokal (fallback offline)
+const SUPABASE_CONFIG_KEY = "maestro:supabase-config"; // simpan URL + anon key project supabase
+const SUPABASE_TABLE = "maestro_state";
+const SUPABASE_ROW_ID = "main";
+// Kredensial bawaan MAESTRO — semua device yang buka file ini otomatis konek ke project Supabase yang sama.
+const DEFAULT_SUPABASE_URL = "https://wztbmucqmuwxpnahladz.supabase.co";
+const DEFAULT_SUPABASE_KEY = "sb_publishable_8Dg5TjjJYDKmeiyPF2NN7A_2dF5VcUi";
+const BULAN = ["Jan", "Feb", "Mar", "Apr", "Mei", "Jun", "Jul", "Agu", "Sep", "Okt", "Nov", "Des"];
+const BULAN_FULL = ["Januari","Februari","Maret","April","Mei","Juni","Juli","Agustus","September","Oktober","November","Desember"];
+
+
+const SETUP_SQL = `create table if not exists maestro_state (
+  id text primary key,
+  payload jsonb not null,
+  updated_at timestamptz not null default now()
+);
+
+alter table maestro_state enable row level security;
+
+create policy "maestro allow all"
+on maestro_state for all
+using (true) with check (true);`;
+
+function uid(p) { return `${p}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`; }
+function formatRupiah(n) {
+  const v = Math.round(n || 0);
+  return (v < 0 ? "-Rp " : "Rp ") + Math.abs(v).toLocaleString("id-ID");
+}
+function formatRupiahCompact(n) {
+  const v = Math.round(n || 0);
+  if (v === 0) return "0";
+  if (v % 1000000 === 0) return `${v / 1000000}jt`;
+  if (v % 1000 === 0) return `${(v / 1000).toLocaleString("id-ID")}rb`;
+  if (v >= 1000000) return `${(v / 1000000).toLocaleString("id-ID", { maximumFractionDigits: 1 })}jt`;
+  if (v >= 1000) return `${(v / 1000).toLocaleString("id-ID", { maximumFractionDigits: 1 })}rb`;
+  return String(v);
+}
+function todayISO() { return new Date().toISOString().slice(0, 10); }
+function formatDateID(iso) {
+  if (!iso) return "-";
+  return new Date(iso).toLocaleDateString("id-ID", { day: "2-digit", month: "short", year: "numeric" });
+}
+function payKey(memberId, year, month) { return `${memberId}:${year}-${month}`; }
+function slugify(s) {
+  return (s || "group")
+    .toString().trim().toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "") || "group";
+}
+// Trigger a real download (works reliably in mobile browsers & installed PWAs,
+// unlike a plain <a href download target="_blank">).
+function saveFile(url, filename) {
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+}
+
+const defaultGroup = (name, amount) => ({
+  name, defaultAmount: amount, openingBalance: 0, openingBalanceNote: "", members: [], payments: {}, expenses: [],
+});
+
+const emptyData = {
+  appName: "MAESTRO",
+  appTagline: "easy does it",
+  auth: { username: "admin", password: "admin123" },
+  groups: { A: defaultGroup("Group A", 50000), B: defaultGroup("Group B", 100000) },
+  activityLog: [],
+};
+
+const STATUS_STYLE = {
+  paid: { label: "Paid", bg: "#DCFCE7", fg: "#15803D" },
+  unpaid: { label: "Belum Bayar", bg: "#FEE2E2", fg: "#B91C1C" },
+  leave: { label: "Vacation", bg: "#FEF3C7", fg: "#B45309" },
+};
+const YEARLY_CELL_STYLE = {
+  paid: { bg: "#DCFCE7", fg: "#15803D", label: "Lunas" },
+  unpaid: { bg: "#FEE2E2", fg: "#B91C1C", label: "Belum Bayar" },
+  leave: { bg: "#FEF3C7", fg: "#B45309", label: "Cuti" },
+};
+
+function Maestro() {
+  const [data, setData] = useState(emptyData);
+  const [loaded, setLoaded] = useState(false);
+  const [saveError, setSaveError] = useState(false);
+
+  const [isLoggedIn, setIsLoggedIn] = useState(false);
+  const [loginUser, setLoginUser] = useState("");
+  const [loginPass, setLoginPass] = useState("");
+  const [loginError, setLoginError] = useState("");
+
+  const [selectedGroup, setSelectedGroup] = useState("A");
+  const [selectedMonth, setSelectedMonth] = useState(new Date().getMonth());
+  const [selectedYear, setSelectedYear] = useState(new Date().getFullYear());
+  const [tab, setTab] = useState("dashboard");
+
+  const [memberModal, setMemberModal] = useState(null); // memberId
+  const [customAmount, setCustomAmount] = useState("");
+  const [useCustom, setUseCustom] = useState(false);
+
+  const [newMemberName, setNewMemberName] = useState("");
+  const [expDate, setExpDate] = useState(todayISO());
+  const [expDesc, setExpDesc] = useState("");
+  const [expAmount, setExpAmount] = useState("");
+
+  const canvasHost = useRef(null);
+  const restoreInputRef = useRef(null);
+  const [reportView, setReportView] = useState("monthly");
+  const [restoreMsg, setRestoreMsg] = useState("");
+  const [exportLinks, setExportLinks] = useState([]);
+
+  // ---- Supabase config & client ----
+  const [supaConfig, setSupaConfig] = useState(null);       // { url, key } | null
+  const [supaConfigChecked, setSupaConfigChecked] = useState(false);
+  const [syncStatus, setSyncStatus] = useState("idle");     // idle | loading | saving | saved | error | offline
+  const [setupUrl, setSetupUrl] = useState("");
+  const [setupKey, setSetupKey] = useState("");
+  const [setupError, setSetupError] = useState("");
+  const [setupBusy, setSetupBusy] = useState(false);
+  const clientRef = useRef(null);
+  const saveTimerRef = useRef(null);
+  const skipNextSaveRef = useRef(false);
+  const lastSyncedRef = useRef(null); // JSON string of the payload currently in sync with Supabase
+
+  // Load supabase config saved on this device (fallback ke kredensial bawaan MAESTRO)
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(SUPABASE_CONFIG_KEY);
+      if (raw) {
+        const cfg = JSON.parse(raw);
+        if (cfg && cfg.url && cfg.key) { setSupaConfig(cfg); setSupaConfigChecked(true); return; }
+      }
+    } catch (e) { /* ignore */ }
+    if (DEFAULT_SUPABASE_URL && DEFAULT_SUPABASE_KEY) {
+      const cfg = { url: DEFAULT_SUPABASE_URL, key: DEFAULT_SUPABASE_KEY };
+      try { localStorage.setItem(SUPABASE_CONFIG_KEY, JSON.stringify(cfg)); } catch (e) { /* ignore */ }
+      setSupaConfig(cfg);
+    }
+    setSupaConfigChecked(true);
+  }, []);
+
+  // Once config is known, connect + load data from Supabase (with local cache fallback)
+  useEffect(() => {
+    if (!supaConfigChecked) return;
+    if (!supaConfig) { setLoaded(true); return; }
+
+    let cancelled = false;
+    setSyncStatus("loading");
+    try {
+      clientRef.current = window.supabase.createClient(supaConfig.url, supaConfig.key);
+    } catch (e) {
+      setSyncStatus("error");
+      setLoaded(true);
+      return;
+    }
+    const client = clientRef.current;
+
+    (async () => {
+      try {
+        const { data: row, error } = await client
+          .from(SUPABASE_TABLE).select("payload").eq("id", SUPABASE_ROW_ID).maybeSingle();
+        if (error) throw error;
+        if (cancelled) return;
+
+        if (row && row.payload) {
+          const merged = { ...emptyData, ...row.payload };
+          lastSyncedRef.current = JSON.stringify(merged);
+          setData(merged);
+        } else {
+          // No row yet: migrate local cache (kalau ada data lama di HP ini) atau mulai kosong
+          let initial = emptyData;
+          try {
+            const raw = localStorage.getItem(STORAGE_KEY);
+            if (raw) initial = { ...emptyData, ...JSON.parse(raw) };
+          } catch (e2) { /* ignore */ }
+          const { error: insErr } = await client
+            .from(SUPABASE_TABLE)
+            .upsert({ id: SUPABASE_ROW_ID, payload: initial, updated_at: new Date().toISOString() });
+          if (insErr) throw insErr;
+          lastSyncedRef.current = JSON.stringify(initial);
+          setData(initial);
+        }
+        setSyncStatus("saved");
+      } catch (e) {
+        // Gagal ambil data dari Supabase (mis. sedang offline). JANGAN mulai dari kosong —
+        // pakai cache lokal di HP ini supaya data yang sudah ada tetap tampil & aman.
+        setSyncStatus(navigator.onLine ? "error" : "offline");
+        try {
+          const raw = localStorage.getItem(STORAGE_KEY);
+          if (raw) {
+            const cached = { ...emptyData, ...JSON.parse(raw) };
+            if (!cancelled) setData(cached);
+            // lastSyncedRef sengaja dibiarkan kosong, supaya begitu online lagi
+            // versi di HP ini otomatis dinaikkan ke cloud.
+          }
+        } catch (e2) { /* ignore */ }
+      } finally {
+        if (!cancelled) setLoaded(true);
+      }
+    })();
+
+    // Realtime: kalau device lain mengubah data, ikut update di sini
+    const channel = client
+      .channel("maestro_state_changes")
+      .on("postgres_changes", { event: "UPDATE", schema: "public", table: SUPABASE_TABLE, filter: `id=eq.${SUPABASE_ROW_ID}` },
+        (payload) => {
+          const incoming = payload.new && payload.new.payload;
+          if (!incoming) return;
+          const incomingStr = JSON.stringify(incoming);
+          if (incomingStr === lastSyncedRef.current) return; // perubahan dari device ini sendiri
+          skipNextSaveRef.current = true;
+          lastSyncedRef.current = incomingStr;
+          setData({ ...emptyData, ...incoming });
+        })
+      .subscribe();
+
+    return () => { cancelled = true; try { client.removeChannel(channel); } catch (e) { /* ignore */ } };
+  }, [supaConfig, supaConfigChecked]);
+
+  // ---- Online/offline awareness ----
+  const [isOnline, setIsOnline] = useState(typeof navigator === "undefined" ? true : navigator.onLine);
+  useEffect(() => {
+    const goOnline = () => { setIsOnline(true); attemptSyncRef.current && attemptSyncRef.current(); };
+    const goOffline = () => { setIsOnline(false); setSyncStatus("offline"); };
+    window.addEventListener("online", goOnline);
+    window.addEventListener("offline", goOffline);
+    return () => { window.removeEventListener("online", goOnline); window.removeEventListener("offline", goOffline); };
+  }, []);
+
+  const attemptSyncRef = useRef(null);
+  const retryTimerRef = useRef(null);
+
+  // Save to Supabase (debounced) whenever data changes — with automatic retry while offline.
+  useEffect(() => {
+    if (!loaded || !supaConfig) return;
+    // Selalu simpan cache lokal dulu — ini yang membuat data TIDAK PERNAH hilang,
+    // baik saat online maupun offline, walau sinkron ke cloud belum/gagal terjadi.
+    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(data)); } catch (e) { /* ignore */ }
+
+    if (skipNextSaveRef.current) { skipNextSaveRef.current = false; return; }
+    const payloadStr = JSON.stringify(data);
+    if (payloadStr === lastSyncedRef.current) return;
+
+    const doSync = async (payload, payloadSnapshot) => {
+      if (!navigator.onLine) { setSyncStatus("offline"); return; }
+      setSyncStatus("saving");
+      try {
+        const client = clientRef.current;
+        if (!client) return;
+        const { error } = await client
+          .from(SUPABASE_TABLE)
+          .upsert({ id: SUPABASE_ROW_ID, payload, updated_at: new Date().toISOString() });
+        if (error) throw error;
+        lastSyncedRef.current = payloadSnapshot;
+        setSyncStatus("saved");
+        setSaveError(false);
+        if (retryTimerRef.current) { clearInterval(retryTimerRef.current); retryTimerRef.current = null; }
+      } catch (e) {
+        setSyncStatus(navigator.onLine ? "error" : "offline");
+        setSaveError(true);
+        // Terus coba lagi tiap 10 detik sampai berhasil (misalnya sinyal balik lagi)
+        if (!retryTimerRef.current) {
+          retryTimerRef.current = setInterval(() => attemptSyncRef.current && attemptSyncRef.current(), 10000);
+        }
+      }
+    };
+
+    attemptSyncRef.current = () => doSync(data, payloadStr);
+
+    if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+    saveTimerRef.current = setTimeout(() => doSync(data, payloadStr), 800);
+    return () => { if (saveTimerRef.current) clearTimeout(saveTimerRef.current); };
+  }, [data, loaded, supaConfig]);
+
+  useEffect(() => () => { if (retryTimerRef.current) clearInterval(retryTimerRef.current); }, []);
+
+  const handleSaveSetup = async () => {
+    setSetupError("");
+    const url = setupUrl.trim().replace(/\/+$/, "");
+    const key = setupKey.trim();
+    if (!url || !key) { setSetupError("URL dan anon key wajib diisi."); return; }
+    setSetupBusy(true);
+    try {
+      const testClient = window.supabase.createClient(url, key);
+      const { error } = await testClient.from(SUPABASE_TABLE).select("id").limit(1);
+      if (error && error.code !== "PGRST116") {
+        // PGRST116 = no rows, itu bukan masalah. Error lain berarti tabel/kredensial belum benar.
+        if (String(error.message || "").toLowerCase().includes("does not exist")) {
+          setSetupError('Tabel "maestro_state" belum ada. Jalankan dulu SQL di bawah ini di Supabase SQL Editor.');
+        } else {
+          setSetupError(`Gagal konek: ${error.message || "cek kembali URL & key"}`);
+        }
+        setSetupBusy(false);
+        return;
+      }
+      const cfg = { url, key };
+      localStorage.setItem(SUPABASE_CONFIG_KEY, JSON.stringify(cfg));
+      setSupaConfig(cfg);
+    } catch (e) {
+      setSetupError("Gagal konek ke Supabase. Cek kembali URL & anon key.");
+    }
+    setSetupBusy(false);
+  };
+
+  const logActivity = useCallback(() => {}, []);
+
+  const handleClearLog = () => {
+    if (!confirm("Hapus semua log aktivitas? Data anggota, pembayaran, dan kas tidak akan terpengaruh.")) return;
+    setData((d) => ({ ...d, activityLog: [] }));
+  };
+
+  const group = data.groups[selectedGroup];
+
+  const handleLogin = () => {
+    if (loginUser === data.auth.username && loginPass === data.auth.password) {
+      setIsLoggedIn(true);
+      setLoginError("");
+    } else {
+      setLoginError("Username atau password salah.");
+    }
+  };
+
+  // ---- Derived data for selected group/month/year ----
+  const memberRows = useMemo(() => {
+    return group.members.map((m) => {
+      const p = group.payments[payKey(m.id, selectedYear, selectedMonth)];
+      return {
+        ...m,
+        status: p ? p.status : "unpaid",
+        amount: p && p.status === "paid" ? p.amount : null,
+              };
+    });
+  }, [group, selectedYear, selectedMonth]);
+
+  const paidCount = memberRows.filter((m) => m.status === "paid").length;
+  const leaveCount = memberRows.filter((m) => m.status === "leave").length;
+  const unpaidCount = memberRows.length - paidCount - leaveCount;
+
+  const monthlyIncome = memberRows.filter((m) => m.status === "paid").reduce((s, m) => s + (m.amount || 0), 0);
+  const monthlyExpenses = useMemo(
+    () => group.expenses.filter((e) => e.date.slice(0, 7) === `${selectedYear}-${String(selectedMonth + 1).padStart(2, "0")}`).reduce((s, e) => s + e.amount, 0),
+    [group, selectedYear, selectedMonth]
+  );
+
+  const allTimeIncome = useMemo(
+    () => Object.values(group.payments).filter((p) => p.status === "paid").reduce((s, p) => s + p.amount, 0),
+    [group]
+  );
+  const allTimeExpenses = useMemo(() => group.expenses.reduce((s, e) => s + e.amount, 0), [group]);
+  const cashBalance = group.openingBalance + allTimeIncome - allTimeExpenses;
+
+  // ---- Member actions ----
+  const updateGroup = (patch) => {
+    setData((d) => ({ ...d, groups: { ...d.groups, [selectedGroup]: { ...d.groups[selectedGroup], ...patch(d.groups[selectedGroup]) } } }));
+  };
+
+  const addMember = () => {
+    if (!newMemberName.trim()) return;
+    const m = { id: uid("m"), nama: newMemberName.trim() };
+    updateGroup((g) => ({ members: [...g.members, m] }));
+    logActivity(`${m.nama} ditambahkan ke ${group.name}`);
+    setNewMemberName("");
+  };
+
+  const removeMember = (id, nama) => {
+    updateGroup((g) => {
+      const payments = { ...g.payments };
+      Object.keys(payments).forEach((k) => { if (k.startsWith(`${id}:`)) delete payments[k]; });
+      return { members: g.members.filter((m) => m.id !== id), payments };
+    });
+    logActivity(`${nama} dihapus dari ${group.name}`);
+  };
+
+  const markPaid = (memberId, nama, amount) => {
+    updateGroup((g) => ({
+      payments: { ...g.payments, [payKey(memberId, selectedYear, selectedMonth)]: { status: "paid", amount } },
+    }));
+    logActivity(`${nama} bayar ${formatRupiah(amount)} (${BULAN_FULL[selectedMonth]} ${selectedYear})`);
+    setMemberModal(null); setUseCustom(false); setCustomAmount("");
+  };
+
+  const markLeave = (memberId, nama) => {
+    updateGroup((g) => ({ payments: { ...g.payments, [payKey(memberId, selectedYear, selectedMonth)]: { status: "leave" } } }));
+    logActivity(`${nama} ditandai Vacation (${BULAN_FULL[selectedMonth]} ${selectedYear})`);
+    setMemberModal(null);
+  };
+
+  const markUnpaid = (memberId, nama) => {
+    updateGroup((g) => {
+      const payments = { ...g.payments };
+      delete payments[payKey(memberId, selectedYear, selectedMonth)];
+      return { payments };
+    });
+    logActivity(`${nama} dibatalkan, kembali ke Belum Bayar (${BULAN_FULL[selectedMonth]} ${selectedYear})`);
+    setMemberModal(null); setUseCustom(false); setCustomAmount("");
+  };
+
+  // ---- Expenses ----
+  const addExpense = () => {
+    const nom = parseFloat(String(expAmount).replace(/[^0-9.-]/g, ""));
+    if (!expDesc.trim() || !nom || nom <= 0) return;
+    updateGroup((g) => ({ expenses: [{ id: uid("e"), date: expDate, description: expDesc.trim(), amount: nom }, ...g.expenses] }));
+    logActivity(`Pengeluaran: ${expDesc.trim()} ${formatRupiah(nom)} (${group.name})`);
+    setExpDesc(""); setExpAmount("");
+  };
+  const removeExpense = (id, desc) => {
+    updateGroup((g) => ({ expenses: g.expenses.filter((e) => e.id !== id) }));
+    logActivity(`Pengeluaran dihapus: ${desc}`);
+  };
+
+  const yearlyBreakdown = useMemo(() => {
+    return BULAN.map((label, month) => {
+      let income = 0;
+      group.members.forEach((m) => {
+        const p = group.payments[payKey(m.id, selectedYear, month)];
+        if (p && p.status === "paid") income += p.amount;
+      });
+      const expense = group.expenses
+        .filter((e) => e.date.slice(0, 7) === `${selectedYear}-${String(month + 1).padStart(2, "0")}`)
+        .reduce((s, e) => s + e.amount, 0);
+      return { label, income, expense, net: income - expense };
+    });
+  }, [group, selectedYear]);
+
+  const memberYearlyMatrix = useMemo(() => {
+    return group.members.map((m) => {
+      let total = 0;
+      const months = BULAN.map((_, month) => {
+        const p = group.payments[payKey(m.id, selectedYear, month)];
+        if (p && p.status === "paid") { total += p.amount; return { status: "paid", amount: p.amount }; }
+        if (p && p.status === "leave") return { status: "leave", amount: 0 };
+        return { status: "unpaid", amount: 0 };
+      });
+      return { id: m.id, nama: m.nama, months, total };
+    });
+  }, [group, selectedYear]);
+
+  const yearlyIncomeTotal = useMemo(() => yearlyBreakdown.reduce((s, r) => s + r.income, 0), [yearlyBreakdown]);
+  const yearlyExpenseTotal = useMemo(() => yearlyBreakdown.reduce((s, r) => s + r.expense, 0), [yearlyBreakdown]);
+
+  const groupComparison = useMemo(() => {
+    return ["A", "B"].map((gk) => {
+      const g = data.groups[gk];
+      const income = Object.values(g.payments).filter((p) => p.status === "paid").reduce((s, p) => s + p.amount, 0);
+      const expense = g.expenses.reduce((s, e) => s + e.amount, 0);
+      return {
+        key: gk, name: g.name, members: g.members.length, income, expense,
+        balance: g.openingBalance + income - expense,
+        openingBalance: g.openingBalance, openingBalanceNote: g.openingBalanceNote,
+      };
+    });
+  }, [data.groups]);
+
+  // ---- Excel export: one separate, polished workbook per group, full selected year ----
+  const handleExportExcel = (groupKey = selectedGroup) => {
+    const exportGroup = data.groups[groupKey];
+    const yr = selectedYear;
+    const monthCount = BULAN.length;
+    // Main table: A=No, B=Nama, C:N=Jan-Des. Tidak ada kolom Total per anggota.
+    const lastCol = 2 + monthCount;
+    const colLetter = (n) => {
+      let out = "";
+      while (n > 0) { const r = (n - 1) % 26; out = String.fromCharCode(65 + r) + out; n = Math.floor((n - 1) / 26); }
+      return out;
+    };
+    const lastColLetter = colLetter(lastCol);
+
+    const borderColor = "CBD5E1";
+    const thinBorder = {
+      top: { style: "thin", color: { rgb: borderColor } },
+      bottom: { style: "thin", color: { rgb: borderColor } },
+      left: { style: "thin", color: { rgb: borderColor } },
+      right: { style: "thin", color: { rgb: borderColor } },
+    };
+    const titleStyle = {
+      font: { bold: true, sz: 16, color: { rgb: "FFFFFF" } },
+      fill: { fgColor: { rgb: "4F46E5" } },
+      alignment: { horizontal: "center", vertical: "center" },
+      border: thinBorder,
+    };
+    const subtitleStyle = {
+      font: { bold: true, sz: 12, color: { rgb: "334155" } },
+      fill: { fgColor: { rgb: "EEF2FF" } },
+      alignment: { horizontal: "center", vertical: "center" },
+      border: thinBorder,
+    };
+    const sectionStyle = {
+      font: { bold: true, sz: 12, color: { rgb: "3730A3" } },
+      fill: { fgColor: { rgb: "E0E7FF" } },
+      alignment: { horizontal: "left", vertical: "center" },
+      border: thinBorder,
+    };
+    const headerStyle = {
+      font: { bold: true, color: { rgb: "FFFFFF" } },
+      fill: { fgColor: { rgb: "6366F1" } },
+      alignment: { horizontal: "center", vertical: "center", wrapText: true },
+      border: thinBorder,
+    };
+    const labelStyle = {
+      font: { bold: true, color: { rgb: "334155" } },
+      fill: { fgColor: { rgb: "F8FAFC" } },
+      alignment: { vertical: "center", wrapText: true },
+      border: thinBorder,
+    };
+    const bodyStyle = {
+      border: thinBorder,
+      alignment: { vertical: "center", wrapText: true },
+    };
+    const centerStyle = {
+      ...bodyStyle,
+      alignment: { horizontal: "center", vertical: "center", wrapText: true },
+    };
+    const moneyStyle = {
+      ...bodyStyle,
+      numFmt: '"Rp" #,##0',
+      alignment: { horizontal: "right", vertical: "center" },
+    };
+    const moneyBoldStyle = {
+      ...moneyStyle,
+      font: { bold: true, color: { rgb: "111827" } },
+      fill: { fgColor: { rgb: "EEF2FF" } },
+    };
+    const totalLabelStyle = {
+      ...labelStyle,
+      fill: { fgColor: { rgb: "EEF2FF" } },
+    };
+
+    const header = ["No", "Nama", ...BULAN];
+    const rows = exportGroup.members.map((m, i) => {
+      const row = [i + 1, m.nama];
+      BULAN.forEach((_, month) => {
+        const pay = exportGroup.payments[payKey(m.id, yr, month)];
+        // Jika sudah bayar: tampilkan NOMINAL SAJA, tanpa tulisan Paid.
+        if (pay && pay.status === "paid") row.push(Number(pay.amount || 0));
+        else if (pay && pay.status === "leave") row.push("Vacation");
+        else row.push("Unpaid");
+      });
+      return row;
+    });
+
+    // Total bulanan tetap dipertahankan karena ini yang dibutuhkan sebagai rekap.
+    const totalsRow = ["", "Total Bulanan"];
+    let grandIncome = 0;
+    BULAN.forEach((_, month) => {
+      let t = 0;
+      exportGroup.members.forEach((m) => {
+        const pay = exportGroup.payments[payKey(m.id, yr, month)];
+        if (pay && pay.status === "paid") t += Number(pay.amount || 0);
+      });
+      grandIncome += t;
+      totalsRow.push(t);
+    });
+
+    const yearlyExpenses = [...exportGroup.expenses]
+      .filter((e) => String(e.date || "").slice(0, 4) === String(yr))
+      .sort((a, b) => new Date(a.date) - new Date(b.date));
+    const yearlyExpenseTotal = yearlyExpenses.reduce((sum, e) => sum + Number(e.amount || 0), 0);
+    const yearlyBalance = Number(exportGroup.openingBalance || 0) + grandIncome - yearlyExpenseTotal;
+    const expenseRows = yearlyExpenses.map((e, i) => [i + 1, formatDateID(e.date), e.description || "", Number(e.amount || 0)]);
+
+    // Layout memakai seluruh lebar laporan untuk bagian ringkasan/pengeluaran,
+    // supaya Keterangan tidak terjepit di satu kolom kecil.
+    const aoa = [
+      [`${data.appName} — ${data.appTagline}`],
+      [`${exportGroup.name} — Rekap Iuran Tahun ${yr}`],
+      [],
+      header,
+      ...rows,
+      totalsRow,
+      [],
+      ["RINGKASAN KEUANGAN"],
+      ["Keterangan", "Nominal"],
+      ["Saldo Awal", Number(exportGroup.openingBalance || 0)],
+      ["Total Pemasukan Tahun", grandIncome],
+      ["Total Pengeluaran Tahun", yearlyExpenseTotal],
+      ["Saldo Akhir Tahun", yearlyBalance],
+      [],
+      ["REKAP PENGELUARAN TAHUN"],
+      ["No", "Tanggal", "Keterangan", "Nominal"],
+      ...expenseRows,
+      ["", "", "Total Pengeluaran", yearlyExpenseTotal],
+      [],
+      [`Dibuat: ${new Date().toLocaleString("id-ID")}`],
+    ];
+
+    const ws = XLSX.utils.aoa_to_sheet(aoa);
+    const summaryTitleRow = 6 + rows.length;
+    const summaryHeaderRow = summaryTitleRow + 1;
+    const summaryFirstRow = summaryHeaderRow + 1;
+    const summaryLastRow = summaryFirstRow + 3;
+    const expenseTitleRow = summaryLastRow + 2;
+    const expenseHeaderRow = expenseTitleRow + 1;
+    const expenseFirstRow = expenseHeaderRow + 1;
+    const expenseLastRow = expenseFirstRow + expenseRows.length - 1;
+    const expenseTotalRow = expenseFirstRow + expenseRows.length;
+    const maxTableRow = 3 + rows.length;
+
+    // Judul utama + judul section digabung agar tidak terpotong.
+    ws["!merges"] = [
+      { s: { r: 0, c: 0 }, e: { r: 0, c: lastCol - 1 } },
+      { s: { r: 1, c: 0 }, e: { r: 1, c: lastCol - 1 } },
+      { s: { r: summaryTitleRow, c: 0 }, e: { r: summaryTitleRow, c: lastCol - 1 } },
+      { s: { r: summaryHeaderRow, c: 0 }, e: { r: summaryHeaderRow, c: 7 } },
+      { s: { r: summaryHeaderRow, c: 8 }, e: { r: summaryHeaderRow, c: lastCol - 1 } },
+      { s: { r: summaryFirstRow, c: 0 }, e: { r: summaryFirstRow, c: 7 } },
+      { s: { r: summaryFirstRow, c: 8 }, e: { r: summaryFirstRow, c: lastCol - 1 } },
+      { s: { r: summaryFirstRow + 1, c: 0 }, e: { r: summaryFirstRow + 1, c: 7 } },
+      { s: { r: summaryFirstRow + 1, c: 8 }, e: { r: summaryFirstRow + 1, c: lastCol - 1 } },
+      { s: { r: summaryFirstRow + 2, c: 0 }, e: { r: summaryFirstRow + 2, c: 7 } },
+      { s: { r: summaryFirstRow + 2, c: 8 }, e: { r: summaryFirstRow + 2, c: lastCol - 1 } },
+      { s: { r: summaryFirstRow + 3, c: 0 }, e: { r: summaryFirstRow + 3, c: 7 } },
+      { s: { r: summaryFirstRow + 3, c: 8 }, e: { r: summaryFirstRow + 3, c: lastCol - 1 } },
+      { s: { r: expenseTitleRow, c: 0 }, e: { r: expenseTitleRow, c: lastCol - 1 } },
+      { s: { r: expenseHeaderRow, c: 1 }, e: { r: expenseHeaderRow, c: 2 } },
+    ];
+    for (let r = expenseFirstRow; r <= expenseTotalRow; r++) {
+      ws["!merges"].push(
+        { s: { r, c: 1 }, e: { r, c: 2 } },
+        { s: { r, c: 3 }, e: { r, c: lastCol - 1 } },
+      );
+    }
+
+    // Lebar kolom: nama cukup untuk nama anggota, bulan seragam dan ringkas.
+    ws["!cols"] = [
+      { wch: 5 },
+      { wch: 18 },
+      ...BULAN.map(() => ({ wch: 9.5 })),
+    ];
+
+    const setCell = (r, c, style, valueIfMissing = "") => {
+      const addr = `${colLetter(c + 1)}${r + 1}`;
+      if (!ws[addr]) ws[addr] = { t: "s", v: valueIfMissing };
+      ws[addr].s = style;
+    };
+
+    // Main table.
+    for (let c = 0; c < lastCol; c++) setCell(3, c, headerStyle);
+    for (let r = 4; r <= maxTableRow; r++) {
+      for (let c = 0; c < lastCol; c++) {
+        const val = ws[`${colLetter(c + 1)}${r + 1}`]?.v;
+        if (c === 0) setCell(r, c, centerStyle);
+        else if (typeof val === "number") setCell(r, c, moneyStyle);
+        else if (c === 1) setCell(r, c, bodyStyle);
+        else setCell(r, c, centerStyle);
+      }
+    }
+    for (let c = 0; c < lastCol; c++) setCell(maxTableRow + 1, c, moneyBoldStyle);
+    setCell(maxTableRow + 1, 1, totalLabelStyle);
+
+    // Summary: Keterangan lebar (A:H), Nominal lebar (I:N), semua diborder.
+    for (let c = 0; c < lastCol; c++) setCell(summaryTitleRow, c, sectionStyle);
+    for (let c = 0; c < 8; c++) setCell(summaryHeaderRow, c, headerStyle);
+    for (let c = 8; c < lastCol; c++) setCell(summaryHeaderRow, c, headerStyle);
+    for (let r = summaryFirstRow; r <= summaryLastRow; r++) {
+      for (let c = 0; c < 8; c++) setCell(r, c, labelStyle);
+      for (let c = 8; c < lastCol; c++) setCell(r, c, moneyStyle);
+    }
+
+    // Expense: No | Tanggal (B:C) | Keterangan (D:N-1) | Nominal (N).
+    for (let c = 0; c < lastCol; c++) setCell(expenseTitleRow, c, sectionStyle);
+    setCell(expenseHeaderRow, 0, headerStyle);
+    for (let c = 1; c <= 2; c++) setCell(expenseHeaderRow, c, headerStyle);
+    for (let c = 3; c < lastCol; c++) setCell(expenseHeaderRow, c, headerStyle);
+    for (let r = expenseFirstRow; r <= expenseLastRow; r++) {
+      setCell(r, 0, centerStyle);
+      for (let c = 1; c <= 2; c++) setCell(r, c, bodyStyle);
+      for (let c = 3; c < lastCol - 1; c++) setCell(r, c, bodyStyle);
+      setCell(r, lastCol - 1, moneyStyle);
+    }
+    for (let c = 0; c < lastCol; c++) setCell(expenseTotalRow, c, c === lastCol - 1 ? moneyBoldStyle : totalLabelStyle);
+
+    // Judul/subjudul.
+    for (let c = 0; c < lastCol; c++) setCell(0, c, titleStyle);
+    for (let c = 0; c < lastCol; c++) setCell(1, c, subtitleStyle);
+
+    const rowHeights = [];
+    rowHeights[0] = { hpt: 28 };
+    rowHeights[1] = { hpt: 22 };
+    rowHeights[2] = { hpt: 8 };
+    rowHeights[3] = { hpt: 24 };
+    for (let r = 4; r <= maxTableRow + 1; r++) rowHeights[r] = { hpt: 21 };
+    rowHeights[summaryTitleRow] = { hpt: 22 };
+    rowHeights[summaryHeaderRow] = { hpt: 24 };
+    for (let r = summaryFirstRow; r <= summaryLastRow; r++) rowHeights[r] = { hpt: 22 };
+    rowHeights[expenseTitleRow] = { hpt: 22 };
+    rowHeights[expenseHeaderRow] = { hpt: 24 };
+    for (let r = expenseFirstRow; r <= expenseTotalRow; r++) rowHeights[r] = { hpt: 22 };
+    ws["!rows"] = rowHeights;
+
+    ws["!autofilter"] = { ref: `A4:${lastColLetter}${maxTableRow + 1}` };
+    ws["!pageSetup"] = { orientation: "landscape", paperSize: 9, fitToWidth: 1, fitToHeight: 0 };
+    ws["!margins"] = { left: 0.2, right: 0.2, top: 0.4, bottom: 0.4, header: 0.2, footer: 0.2 };
+    ws["!sheetPr"] = { pageSetUpPr: { fitToPage: true } };
+
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, exportGroup.name.slice(0, 28));
+    const wbout = XLSX.write(wb, { bookType: "xlsx", type: "array", cellStyles: true });
+    const blob = new Blob([wbout], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+    const url = URL.createObjectURL(blob);
+    setExportLinks((prev) => [
+      { id: uid("xls"), kind: "excel", filename: `${slugify(exportGroup.name)}-${yr}.xlsx`, url },
+      ...prev,
+    ]);
+  };
+
+  // ---- Backup / Restore ----
+  const [backupMsg, setBackupMsg] = useState("");
+  const handleBackup = () => {
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const filename = `maestro-backup-${todayISO()}.json`;
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
+    setBackupMsg(`Backup "${filename}" sudah diunduh — cek folder Downloads/Files di HP kamu.`);
+    logActivity("Backup data diunduh");
+  };
+
+  const handleRestoreFile = (file) => {
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const parsed = JSON.parse(e.target.result);
+        if (!parsed.groups || !parsed.auth) throw new Error("format tidak valid");
+        setData({ ...emptyData, ...parsed });
+        setRestoreMsg("Data berhasil dipulihkan.");
+        logActivity("Data dipulihkan dari file backup");
+      } catch (err) {
+        setRestoreMsg("Gagal memulihkan: file tidak valid.");
+      }
+    };
+    reader.readAsText(file);
+  };
+
+  // ---- PNG export via canvas (paginated) ----
+  const handleDownloadPNG = () => {
+    const ROWS_PER_PAGE = 22;
+    const pages = Math.max(1, Math.ceil(memberRows.length / ROWS_PER_PAGE));
+    for (let p = 0; p < pages; p++) {
+      const pageMembers = memberRows.slice(p * ROWS_PER_PAGE, (p + 1) * ROWS_PER_PAGE);
+      drawReportPage(pageMembers, p + 1, pages);
+    }
+    logActivity(`PNG ${group.name} dibuat (${pages} halaman)`);
+  };
+
+  function drawReportPage(pageMembers, pageNum, totalPages) {
+    const W = 720;
+    const rowH = 30;
+    const topH = 300;
+    const bottomH = 165;
+    const H = topH + pageMembers.length * rowH + bottomH;
+    const canvas = document.createElement("canvas");
+    canvas.width = W; canvas.height = H;
+    const ctx = canvas.getContext("2d");
+
+    ctx.fillStyle = "#F8FAFC"; ctx.fillRect(0, 0, W, H);
+
+    // Header band
+    const grad = ctx.createLinearGradient(0, 0, W, 0);
+    grad.addColorStop(0, "#6366F1"); grad.addColorStop(1, "#8B5CF6");
+    ctx.fillStyle = grad; ctx.fillRect(0, 0, W, 86);
+    ctx.fillStyle = "#FFFFFF";
+    ctx.font = "700 26px 'Plus Jakarta Sans', sans-serif";
+    ctx.fillText(data.appName, 24, 40);
+    ctx.font = "500 13px Inter, sans-serif";
+    ctx.fillStyle = "rgba(255,255,255,0.85)";
+    ctx.fillText(data.appTagline, 24, 62);
+    ctx.textAlign = "right";
+    ctx.font = "600 15px Inter, sans-serif";
+    ctx.fillText(`${group.name}`, W - 24, 38);
+    ctx.font = "400 13px Inter, sans-serif";
+    ctx.fillText(`${BULAN_FULL[selectedMonth]} ${selectedYear}`, W - 24, 58);
+    ctx.textAlign = "left";
+
+    // Summary cards
+    const cards = [
+      ["Saldo Kas", formatRupiah(cashBalance), "#4F46E5"],
+      ["Pemasukan", formatRupiah(monthlyIncome), "#16A34A"],
+      ["Pengeluaran", formatRupiah(monthlyExpenses), "#DC2626"],
+      ["Paid", String(paidCount), "#16A34A"],
+      ["Belum Bayar", String(unpaidCount), "#DC2626"],
+      ["Vacation", String(leaveCount), "#D97706"],
+    ];
+    const cw = (W - 24 * 2 - 8 * 2) / 3;
+    cards.forEach((c, i) => {
+      const col = i % 3, row = Math.floor(i / 3);
+      const x = 24 + col * (cw + 8), y = 100 + row * 62;
+      ctx.fillStyle = "#FFFFFF";
+      roundRect(ctx, x, y, cw, 54, 10); ctx.fill();
+      ctx.fillStyle = "#94A3B8"; ctx.font = "600 10px Inter, sans-serif";
+      ctx.fillText(c[0].toUpperCase(), x + 10, y + 18);
+      ctx.fillStyle = c[2]; ctx.font = "700 16px 'Plus Jakarta Sans', sans-serif";
+      ctx.fillText(c[1], x + 10, y + 40);
+    });
+
+    // Table header
+    let y = 240;
+    ctx.fillStyle = "#1E293B"; ctx.font = "700 12px Inter, sans-serif";
+    ctx.fillText("No", 24, y);
+    ctx.fillText("Nama", 54, y);
+    ctx.fillText("Status", 340, y);
+    ctx.fillText("Nominal", 540, y);
+    y += 10;
+    ctx.strokeStyle = "#E2E8F0"; ctx.beginPath(); ctx.moveTo(24, y); ctx.lineTo(W - 24, y); ctx.stroke();
+
+    pageMembers.forEach((m, idx) => {
+      const ry = y + 22 + idx * rowH;
+      ctx.fillStyle = "#334155"; ctx.font = "500 12px Inter, sans-serif";
+      ctx.fillText(String((memberRows.indexOf(m)) + 1), 24, ry);
+      ctx.fillText(m.nama.length > 26 ? m.nama.slice(0, 25) + "…" : m.nama, 54, ry);
+      const st = STATUS_STYLE[m.status];
+      ctx.fillStyle = st.bg; roundRect(ctx, 335, ry - 14, 74, 20, 6); ctx.fill();
+      ctx.fillStyle = st.fg; ctx.font = "600 10px Inter, sans-serif";
+      ctx.fillText(st.label, 348, ry);
+      ctx.fillStyle = "#1E293B"; ctx.font = "500 12px Inter, sans-serif";
+      ctx.fillText(m.status === "paid" ? formatRupiah(m.amount) : "-", 540, ry);
+      ctx.strokeStyle = "#F1F5F9"; ctx.beginPath(); ctx.moveTo(24, ry + 8); ctx.lineTo(W - 24, ry + 8); ctx.stroke();
+    });
+
+    // Footer totals
+    let fy = topH + pageMembers.length * rowH + 20;
+    ctx.strokeStyle = "#CBD5E1"; ctx.beginPath(); ctx.moveTo(24, fy - 14); ctx.lineTo(W - 24, fy - 14); ctx.stroke();
+    ctx.font = "600 12px Inter, sans-serif"; ctx.fillStyle = "#334155";
+    const obLabel = group.openingBalanceNote ? `Saldo Awal (${group.openingBalanceNote}): ${formatRupiah(group.openingBalance)}` : `Saldo Awal: ${formatRupiah(group.openingBalance)}`;
+    ctx.fillText(obLabel, 24, fy); fy += 20;
+    ctx.fillText(`Pemasukan Bulan Ini: ${formatRupiah(monthlyIncome)}`, 24, fy); fy += 20;
+    ctx.fillText(`Pengeluaran Bulan Ini: ${formatRupiah(monthlyExpenses)}`, 24, fy); fy += 20;
+    ctx.font = "700 13px 'Plus Jakarta Sans', sans-serif"; ctx.fillStyle = "#4F46E5";
+    ctx.fillText(`Saldo Akhir: ${formatRupiah(cashBalance)}`, 24, fy); fy += 22;
+    ctx.font = "400 10px Inter, sans-serif"; ctx.fillStyle = "#94A3B8";
+    ctx.fillText(`Dibuat ${new Date().toLocaleString("id-ID")} — Hal ${pageNum}/${totalPages}`, 24, fy);
+
+    const filename = `${slugify(group.name)}-${selectedYear}-${selectedMonth + 1}-hal${pageNum}.png`;
+    canvas.toBlob((blob) => {
+      const url = URL.createObjectURL(blob);
+      setExportLinks((prev) => [{ id: uid("png"), kind: "png", filename, url, page: pageNum, totalPages }, ...prev]);
+    }, "image/png");
+  }
+
+  // ---- Yearly report PNG export (matrix: Nama x 12 bulan, nominal/status + total) ----
+  const handleDownloadYearlyPNG = () => {
+    const ROWS_PER_PAGE = 30;
+    const pages = Math.max(1, Math.ceil(memberYearlyMatrix.length / ROWS_PER_PAGE));
+    for (let p = 0; p < pages; p++) {
+      const pageMembers = memberYearlyMatrix.slice(p * ROWS_PER_PAGE, (p + 1) * ROWS_PER_PAGE);
+      drawYearlyReportPage(pageMembers, p + 1, pages, p === pages - 1);
+    }
+    logActivity(`PNG Rekap Tahunan ${group.name} ${selectedYear} dibuat (${pages} halaman)`);
+  };
+
+  function drawYearlyReportPage(pageMembers, pageNum, totalPages, isLastPage) {
+    const W = 1090;
+    const marginX = 24;
+    const nameColW = 120;
+    const totalColW = 72;
+    const monthColW = (W - marginX * 2 - nameColW - totalColW) / 12;
+    const rowH = 30;
+    const topH = 210;
+    const totalsRowH = isLastPage ? 34 : 0;
+    const bottomH = 90 + totalsRowH;
+    const H = topH + 26 + pageMembers.length * rowH + bottomH;
+    const canvas = document.createElement("canvas");
+    canvas.width = W; canvas.height = H;
+    const ctx = canvas.getContext("2d");
+
+    ctx.fillStyle = "#F8FAFC"; ctx.fillRect(0, 0, W, H);
+
+    // Header band
+    const grad = ctx.createLinearGradient(0, 0, W, 0);
+    grad.addColorStop(0, "#6366F1"); grad.addColorStop(1, "#8B5CF6");
+    ctx.fillStyle = grad; ctx.fillRect(0, 0, W, 86);
+    ctx.fillStyle = "#FFFFFF";
+    ctx.font = "700 26px 'Plus Jakarta Sans', sans-serif";
+    ctx.fillText(data.appName, marginX, 40);
+    ctx.font = "500 13px Inter, sans-serif";
+    ctx.fillStyle = "rgba(255,255,255,0.85)";
+    ctx.fillText(data.appTagline, marginX, 62);
+    ctx.textAlign = "right";
+    ctx.font = "600 15px Inter, sans-serif";
+    ctx.fillText(`${group.name}`, W - marginX, 38);
+    ctx.font = "400 13px Inter, sans-serif";
+    ctx.fillText(`Rekap Tahunan ${selectedYear}`, W - marginX, 58);
+    ctx.textAlign = "left";
+
+    // Summary cards
+    const obLabel = group.openingBalanceNote ? `Saldo Awal (${group.openingBalanceNote})` : "Saldo Awal";
+    const cards = [
+      [obLabel, formatRupiah(group.openingBalance), "#334155"],
+      ["Pemasukan Tahun Ini", formatRupiah(yearlyIncomeTotal), "#16A34A"],
+      ["Pengeluaran Tahun Ini", formatRupiah(yearlyExpenseTotal), "#DC2626"],
+      ["Saldo Kas Saat Ini", formatRupiah(cashBalance), "#4F46E5"],
+    ];
+    const cw = (W - marginX * 2 - 8 * 3) / 4;
+    cards.forEach((c, i) => {
+      const x = marginX + i * (cw + 8), y = 100;
+      ctx.fillStyle = "#FFFFFF";
+      roundRect(ctx, x, y, cw, 54, 10); ctx.fill();
+      ctx.fillStyle = "#94A3B8"; ctx.font = "600 9px Inter, sans-serif";
+      ctx.fillText(c[0].toUpperCase(), x + 10, y + 18);
+      ctx.fillStyle = c[2]; ctx.font = "700 14px 'Plus Jakarta Sans', sans-serif";
+      ctx.fillText(c[1], x + 10, y + 40);
+    });
+
+    // Table header
+    let y = topH;
+    ctx.fillStyle = "#1E293B"; ctx.font = "700 12px Inter, sans-serif";
+    ctx.fillText("Nama", marginX, y);
+    BULAN.forEach((b, i) => {
+      const cx = marginX + nameColW + i * monthColW + monthColW / 2;
+      ctx.textAlign = "center";
+      ctx.fillText(b, cx, y);
+      ctx.textAlign = "left";
+    });
+    ctx.textAlign = "center";
+    ctx.fillText("Total", marginX + nameColW + 12 * monthColW + totalColW / 2, y);
+    ctx.textAlign = "left";
+    y += 10;
+    ctx.strokeStyle = "#E2E8F0"; ctx.beginPath(); ctx.moveTo(marginX, y); ctx.lineTo(W - marginX, y); ctx.stroke();
+
+    pageMembers.forEach((m, idx) => {
+      const ry = y + 22 + idx * rowH;
+      ctx.fillStyle = "#334155"; ctx.font = "600 12px Inter, sans-serif";
+      ctx.fillText(m.nama.length > 15 ? m.nama.slice(0, 14) + "…" : m.nama, marginX, ry);
+      m.months.forEach((cell, i) => {
+        const st = YEARLY_CELL_STYLE[cell.status];
+        const label = cell.status === "paid" ? formatRupiahCompact(cell.amount) : st.label;
+        const cx = marginX + nameColW + i * monthColW + 4;
+        const cellW = monthColW - 8;
+        ctx.fillStyle = st.bg; roundRect(ctx, cx, ry - 14, cellW, 20, 6); ctx.fill();
+        ctx.fillStyle = st.fg; ctx.font = "600 9px Inter, sans-serif";
+        ctx.textAlign = "center";
+        ctx.fillText(label, cx + cellW / 2, ry);
+        ctx.textAlign = "left";
+      });
+      ctx.fillStyle = "#4F46E5"; ctx.font = "700 11px Inter, sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillText(formatRupiahCompact(m.total), marginX + nameColW + 12 * monthColW + totalColW / 2, ry);
+      ctx.textAlign = "left";
+      ctx.strokeStyle = "#F1F5F9"; ctx.beginPath(); ctx.moveTo(marginX, ry + 8); ctx.lineTo(W - marginX, ry + 8); ctx.stroke();
+    });
+
+    let fy = y + 22 + pageMembers.length * rowH;
+
+    // Totals row (per bulan) — hanya di halaman terakhir
+    if (isLastPage) {
+      ctx.strokeStyle = "#CBD5E1"; ctx.beginPath(); ctx.moveTo(marginX, fy - 20); ctx.lineTo(W - marginX, fy - 20); ctx.stroke();
+      ctx.fillStyle = "#1E293B"; ctx.font = "700 11px Inter, sans-serif";
+      ctx.fillText("Total Terkumpul", marginX, fy);
+      yearlyBreakdown.forEach((r, i) => {
+        const cx = marginX + nameColW + i * monthColW + monthColW / 2;
+        ctx.textAlign = "center";
+        ctx.fillText(formatRupiahCompact(r.income), cx, fy);
+        ctx.textAlign = "left";
+      });
+      ctx.fillStyle = "#4F46E5"; ctx.font = "700 11px Inter, sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillText(formatRupiahCompact(yearlyIncomeTotal), marginX + nameColW + 12 * monthColW + totalColW / 2, fy);
+      ctx.textAlign = "left";
+      fy += totalsRowH;
+    }
+
+    // Footer
+    ctx.strokeStyle = "#CBD5E1"; ctx.beginPath(); ctx.moveTo(marginX, fy - 4); ctx.lineTo(W - marginX, fy - 4); ctx.stroke();
+    fy += 16;
+    ctx.font = "400 10px Inter, sans-serif"; ctx.fillStyle = "#94A3B8";
+    ctx.fillText("Lunas = nominal dibayar · Belum = belum bayar · Cuti = Vacation", marginX, fy); fy += 16;
+    ctx.fillText(`Dibuat ${new Date().toLocaleString("id-ID")} — Hal ${pageNum}/${totalPages}`, marginX, fy);
+
+    const filename = `${slugify(group.name)}-rekap-tahunan-${selectedYear}-hal${pageNum}.png`;
+    canvas.toBlob((blob) => {
+      const url = URL.createObjectURL(blob);
+      setExportLinks((prev) => [{ id: uid("png"), kind: "png", filename, url, page: pageNum, totalPages }, ...prev]);
+    }, "image/png");
+  }
+
+  // ---- Expense-only PNG export (all expenses, detail + akumulasi + sisa saldo) ----
+  const handleDownloadExpensePNG = () => {
+    const allExpenses = [...group.expenses].sort((a, b) => new Date(b.date) - new Date(a.date));
+    const ROWS_PER_PAGE = 26;
+    const pages = Math.max(1, Math.ceil(allExpenses.length / ROWS_PER_PAGE));
+    for (let p = 0; p < pages; p++) {
+      const pageExpenses = allExpenses.slice(p * ROWS_PER_PAGE, (p + 1) * ROWS_PER_PAGE);
+      drawExpenseReportPage(pageExpenses, p + 1, pages, allExpenses.length);
+    }
+    logActivity(`PNG Pengeluaran ${group.name} dibuat (${pages} halaman)`);
+  };
+
+  function drawExpenseReportPage(pageExpenses, pageNum, totalPages, totalCount) {
+    const W = 720;
+    const rowH = 30;
+    const topH = 230;
+    const bottomH = 140;
+    const H = topH + pageExpenses.length * rowH + bottomH;
+    const canvas = document.createElement("canvas");
+    canvas.width = W; canvas.height = H;
+    const ctx = canvas.getContext("2d");
+
+    ctx.fillStyle = "#F8FAFC"; ctx.fillRect(0, 0, W, H);
+
+    // Header band
+    const grad = ctx.createLinearGradient(0, 0, W, 0);
+    grad.addColorStop(0, "#F43F5E"); grad.addColorStop(1, "#EC4899");
+    ctx.fillStyle = grad; ctx.fillRect(0, 0, W, 86);
+    ctx.fillStyle = "#FFFFFF";
+    ctx.font = "700 26px 'Plus Jakarta Sans', sans-serif";
+    ctx.fillText(data.appName, 24, 40);
+    ctx.font = "500 13px Inter, sans-serif";
+    ctx.fillStyle = "rgba(255,255,255,0.85)";
+    ctx.fillText("Detail Pengeluaran", 24, 62);
+    ctx.textAlign = "right";
+    ctx.font = "600 15px Inter, sans-serif";
+    ctx.fillText(`${group.name}`, W - 24, 38);
+    ctx.font = "400 13px Inter, sans-serif";
+    ctx.fillText(`${totalCount} transaksi`, W - 24, 58);
+    ctx.textAlign = "left";
+
+    // Summary cards: Akumulasi Pengeluaran, Sisa Saldo
+    const cards = [
+      ["Akumulasi Pengeluaran", formatRupiah(allTimeExpenses), "#DC2626"],
+      ["Sisa Saldo", formatRupiah(cashBalance), "#4F46E5"],
+    ];
+    const cw = (W - 24 * 2 - 8) / 2;
+    cards.forEach((c, i) => {
+      const x = 24 + i * (cw + 8), y = 100;
+      ctx.fillStyle = "#FFFFFF";
+      roundRect(ctx, x, y, cw, 60, 10); ctx.fill();
+      ctx.fillStyle = "#94A3B8"; ctx.font = "600 10px Inter, sans-serif";
+      ctx.fillText(c[0].toUpperCase(), x + 12, y + 20);
+      ctx.fillStyle = c[2]; ctx.font = "700 18px 'Plus Jakarta Sans', sans-serif";
+      ctx.fillText(c[1], x + 12, y + 45);
+    });
+
+    // Table header
+    let y = 195;
+    ctx.fillStyle = "#1E293B"; ctx.font = "700 12px Inter, sans-serif";
+    ctx.fillText("No", 24, y);
+    ctx.fillText("Tanggal", 60, y);
+    ctx.fillText("Keterangan", 165, y);
+    ctx.fillText("Nominal", 560, y);
+    y += 10;
+    ctx.strokeStyle = "#E2E8F0"; ctx.beginPath(); ctx.moveTo(24, y); ctx.lineTo(W - 24, y); ctx.stroke();
+
+    pageExpenses.forEach((e, idx) => {
+      const ry = y + 22 + idx * rowH;
+      const globalIdx = allTimeExpenseIndex(e) ;
+      ctx.fillStyle = "#334155"; ctx.font = "500 12px Inter, sans-serif";
+      ctx.fillText(String(globalIdx), 24, ry);
+      ctx.fillText(formatDateID(e.date), 60, ry);
+      const desc = e.description.length > 42 ? e.description.slice(0, 41) + "…" : e.description;
+      ctx.fillText(desc, 165, ry);
+      ctx.fillStyle = "#DC2626"; ctx.font = "600 12px Inter, sans-serif";
+      ctx.fillText(formatRupiah(e.amount), 560, ry);
+      ctx.strokeStyle = "#F1F5F9"; ctx.beginPath(); ctx.moveTo(24, ry + 8); ctx.lineTo(W - 24, ry + 8); ctx.stroke();
+    });
+
+    // Footer
+    let fy = topH + pageExpenses.length * rowH + 20;
+    ctx.strokeStyle = "#CBD5E1"; ctx.beginPath(); ctx.moveTo(24, fy - 14); ctx.lineTo(W - 24, fy - 14); ctx.stroke();
+    ctx.font = "700 13px 'Plus Jakarta Sans', sans-serif"; ctx.fillStyle = "#DC2626";
+    ctx.fillText(`Total Akumulasi Pengeluaran: ${formatRupiah(allTimeExpenses)}`, 24, fy); fy += 20;
+    ctx.fillStyle = "#4F46E5";
+    ctx.fillText(`Sisa Saldo: ${formatRupiah(cashBalance)}`, 24, fy); fy += 22;
+    ctx.font = "400 10px Inter, sans-serif"; ctx.fillStyle = "#94A3B8";
+    ctx.fillText(`Dibuat ${new Date().toLocaleString("id-ID")} — Hal ${pageNum}/${totalPages}`, 24, fy);
+
+    const filename = `${slugify(group.name)}-pengeluaran-hal${pageNum}.png`;
+    canvas.toBlob((blob) => {
+      const url = URL.createObjectURL(blob);
+      setExportLinks((prev) => [{ id: uid("png"), kind: "png", filename, url, page: pageNum, totalPages }, ...prev]);
+    }, "image/png");
+  }
+
+  function allTimeExpenseIndex(expense) {
+    const chronological = [...group.expenses].sort((a, b) => new Date(a.date) - new Date(b.date));
+    return chronological.findIndex((e) => e.id === expense.id) + 1;
+  }
+
+  function roundRect(ctx, x, y, w, h, r) {
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+  }
+
+  // ================= RENDER =================
+
+  if (!supaConfigChecked) return null;
+
+  // ---- Setup Supabase (wajib sekali di awal per device/browser) ----
+  if (!supaConfig) {
+    return (
+      <div className="min-h-screen flex items-center justify-center px-5 py-8" style={{ background: "linear-gradient(135deg,#6366F1,#8B5CF6 50%,#EC4899)", fontFamily: "'Inter',sans-serif" }}>
+        <div className="bg-white rounded-2xl shadow-2xl p-6 w-full max-w-sm">
+          <h1 className="text-2xl font-extrabold mb-0.5" style={{ fontFamily: "'Plus Jakarta Sans',sans-serif", color: "#312E81" }}>Setup Supabase</h1>
+          <p className="text-xs mb-4" style={{ color: "#94A3B8" }}>Dilakukan sekali saja supaya data MAESTRO tersimpan di cloud dan sama di semua device.</p>
+
+          <div className="rounded-xl p-3 mb-4" style={{ background: "#EEF2FF" }}>
+            <p className="text-xs font-semibold mb-1" style={{ color: "#4F46E5" }}>Langkah-langkah:</p>
+            <ol className="text-xs list-decimal ml-4 space-y-1" style={{ color: "#4338CA" }}>
+              <li>Buat project gratis di supabase.com (kalau belum punya)</li>
+              <li>Buka SQL Editor di project itu, jalankan SQL di bawah ini</li>
+              <li>Buka Project Settings → API, salin "Project URL" dan "anon public key"</li>
+              <li>Tempel di bawah, lalu tekan Simpan &amp; Konek</li>
+            </ol>
+          </div>
+
+          <textarea readOnly value={SETUP_SQL} onClick={(e) => e.target.select()}
+            className="w-full text-xs font-mono rounded-lg p-2.5 mb-3" rows={7}
+            style={{ background: "#0F172A", color: "#A5B4FC", borderColor: "#0F172A" }} />
+          <p className="text-xs mb-4" style={{ color: "#94A3B8" }}>👆 Ketuk untuk pilih semua, lalu salin ke SQL Editor Supabase.</p>
+
+          <input value={setupUrl} onChange={(e) => setSetupUrl(e.target.value)} placeholder="Project URL (https://xxxx.supabase.co)"
+            className="w-full border rounded-xl px-3 py-2.5 text-sm outline-none mb-2" style={{ borderColor: "#E2E8F0" }} />
+          <input value={setupKey} onChange={(e) => setSetupKey(e.target.value)} placeholder="anon public key"
+            className="w-full border rounded-xl px-3 py-2.5 text-sm outline-none mb-2" style={{ borderColor: "#E2E8F0" }} />
+          {setupError && <p className="text-xs mb-2" style={{ color: "#DC2626" }}>{setupError}</p>}
+          <button onClick={handleSaveSetup} disabled={setupBusy} className="w-full py-3 rounded-xl text-white font-semibold text-sm mt-1"
+            style={{ background: "linear-gradient(135deg,#6366F1,#8B5CF6)", opacity: setupBusy ? 0.7 : 1 }}>
+            {setupBusy ? "Menghubungkan…" : "Simpan & Konek"}
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  if (!loaded) {
+    return (
+      <div className="min-h-screen flex items-center justify-center" style={{ background: "#F1F5F9", fontFamily: "'Inter',sans-serif" }}>
+        <p className="text-sm" style={{ color: "#64748B" }}>Memuat data…</p>
+      </div>
+    );
+  }
+
+  if (!isLoggedIn) {
+    return (
+      <div
+        className="min-h-screen flex items-center justify-center px-5"
+        style={{ background: "linear-gradient(135deg,#6366F1,#8B5CF6 50%,#EC4899)", fontFamily: "'Inter',sans-serif" }}
+      >
+        <div className="bg-white rounded-2xl shadow-2xl p-7 w-full max-w-sm">
+          <h1 className="text-3xl font-extrabold text-center mb-0.5" style={{ fontFamily: "'Plus Jakarta Sans',sans-serif", color: "#312E81" }}>
+            {data.appName}
+          </h1>
+          <p className="text-center text-xs italic mb-6" style={{ color: "#94A3B8" }}>{data.appTagline}</p>
+          <div className="flex items-center gap-2 border rounded-xl px-3 py-2.5 mb-3" style={{ borderColor: "#E2E8F0" }}>
+            👤
+            <input value={loginUser} onChange={(e) => setLoginUser(e.target.value)} placeholder="Username"
+              className="flex-1 outline-none text-sm" onKeyDown={(e) => e.key === "Enter" && handleLogin()} />
+          </div>
+          <div className="flex items-center gap-2 border rounded-xl px-3 py-2.5 mb-2" style={{ borderColor: "#E2E8F0" }}>
+            🔒
+            <input type="password" value={loginPass} onChange={(e) => setLoginPass(e.target.value)} placeholder="Password"
+              className="flex-1 outline-none text-sm" onKeyDown={(e) => e.key === "Enter" && handleLogin()} />
+          </div>
+          {loginError && <p className="text-xs mb-3" style={{ color: "#DC2626" }}>{loginError}</p>}
+          <button onClick={handleLogin} className="w-full py-3 rounded-xl text-white font-semibold text-sm mt-2"
+            style={{ background: "linear-gradient(135deg,#6366F1,#8B5CF6)" }}>
+            Masuk
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  const modalMember = memberModal ? memberRows.find((m) => m.id === memberModal) : null;
+
+  // ---------- MAIN APP ----------
+  return (
+    <div className="min-h-screen maestro-nav-safe" style={{ background: "#F1F5F9", fontFamily: "'Inter',sans-serif" }}>
+      {/* Top bar */}
+      <div className="text-white px-4 pt-5 pb-4" style={{ background: "linear-gradient(135deg,#6366F1,#8B5CF6)" }}>
+        <div className="flex items-center justify-between mb-4">
+          <div>
+            <h1 className="text-2xl font-extrabold leading-none" style={{ fontFamily: "'Plus Jakarta Sans',sans-serif" }}>{data.appName}</h1>
+            <p className="text-xs italic opacity-80 flex items-center gap-1 mt-1">
+              {data.appTagline}
+              <span title={
+                syncStatus === "offline" ? "Mode offline — data aman di HP, akan sinkron otomatis saat online"
+                : syncStatus === "error" ? "Gagal sinkron, dicoba lagi otomatis"
+                : syncStatus === "saving" ? "Menyimpan…" : "Tersimpan di cloud"
+              }>
+                {syncStatus === "offline" ? "📴" : syncStatus === "saving" ? "🔄" : syncStatus === "error" ? "⚠️" : "☁️"}
+              </span>
+            </p>
+          </div>
+          <button onClick={() => setIsLoggedIn(false)} className="px-3 py-2 rounded-xl text-xs font-semibold" style={{ background: "rgba(255,255,255,0.16)" }}>Keluar</button>
+        </div>
+        <div className="mb-2">
+          <div className="flex gap-2">
+            {["A", "B"].map((g) => (
+              <button key={g} onClick={() => setSelectedGroup(g)}
+                className="flex-1 py-2.5 rounded-xl text-sm font-bold transition-colors"
+                style={{ background: selectedGroup === g ? "white" : "rgba(255,255,255,0.15)", color: selectedGroup === g ? "#4F46E5" : "white" }}>
+                {data.groups[g].name}
+              </button>
+            ))}
+          </div>
+        </div>
+        <div className="flex items-center gap-2">
+          <button onClick={() => setSelectedMonth((m) => m === 0 ? 11 : m - 1)} className="w-10 h-10 rounded-xl text-lg" style={{ background: "rgba(255,255,255,0.16)" }}>‹</button>
+          <select value={selectedMonth} onChange={(e) => setSelectedMonth(Number(e.target.value))}
+            className="flex-1 rounded-xl px-3 py-2.5 text-sm font-semibold outline-none" style={{ background: "rgba(255,255,255,0.95)", color: "#334155" }}>
+            {BULAN_FULL.map((b, i) => <option key={b} value={i}>{b}</option>)}
+          </select>
+          <div className="flex items-center gap-1 rounded-xl px-2 py-2" style={{ background: "rgba(255,255,255,0.95)" }}>
+            <button onClick={() => setSelectedYear((y) => y - 1)} className="text-slate-700 px-1">‹</button>
+            <span className="text-sm text-slate-700 font-bold px-1">{selectedYear}</span>
+            <button onClick={() => setSelectedYear((y) => y + 1)} className="text-slate-700 px-1">›</button>
+          </div>
+          <button onClick={() => setSelectedMonth((m) => m === 11 ? 0 : m + 1)} className="w-10 h-10 rounded-xl text-lg" style={{ background: "rgba(255,255,255,0.16)" }}>›</button>
+        </div>
+      </div>
+
+      <div className="max-w-md mx-auto px-4 py-4">
+        {tab === "dashboard" && (
+          <>
+            <div className="bg-white rounded-2xl shadow-sm p-4 mb-3.5 border" style={{ borderColor: "#E2E8F0" }}>
+              <p className="text-[10px] font-bold uppercase tracking-wider" style={{ color: "#94A3B8" }}>Saldo Kas</p>
+              <p className="text-2xl font-extrabold mt-1" style={{ color: "#4F46E5", fontFamily: "'Plus Jakarta Sans',sans-serif" }}>{formatRupiah(cashBalance)}</p>
+              <div className="grid grid-cols-2 gap-2 mt-3">
+                <div className="rounded-xl p-2.5" style={{ background: "#F0FDF4" }}>
+                  <p className="text-[10px] font-semibold uppercase" style={{ color: "#64748B" }}>Pemasukan</p>
+                  <p className="text-sm font-bold mt-0.5" style={{ color: "#16A34A" }}>{formatRupiah(monthlyIncome)}</p>
+                </div>
+                <div className="rounded-xl p-2.5" style={{ background: "#FEF2F2" }}>
+                  <p className="text-[10px] font-semibold uppercase" style={{ color: "#64748B" }}>Pengeluaran</p>
+                  <p className="text-sm font-bold mt-0.5" style={{ color: "#DC2626" }}>{formatRupiah(monthlyExpenses)}</p>
+                </div>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-3 gap-2 mb-3.5">
+              <StatusMini label="Lunas" value={paidCount} bg="#F0FDF4" fg="#16A34A" />
+              <StatusMini label="Belum Bayar" value={unpaidCount} bg="#FEF2F2" fg="#DC2626" />
+              <StatusMini label="Vacation" value={leaveCount} bg="#FFFBEB" fg="#B45309" />
+            </div>
+
+            <div className="grid grid-cols-2 gap-2 mb-4">
+              <button onClick={() => setTab("expenses")} className="maestro-quick-btn bg-white rounded-xl shadow-sm border p-3 text-left" style={{ borderColor: "#E2E8F0" }}>
+                <span className="text-lg">💸</span>
+                <p className="text-sm font-bold mt-1">Catat Pengeluaran</p>
+                <p className="text-[10px] mt-0.5" style={{ color: "#94A3B8" }}>Tambah uang keluar</p>
+              </button>
+              <button onClick={() => setTab("reports")} className="maestro-quick-btn bg-white rounded-xl shadow-sm border p-3 text-left" style={{ borderColor: "#E2E8F0" }}>
+                <span className="text-lg">📊</span>
+                <p className="text-sm font-bold mt-1">Buka Rekap</p>
+                <p className="text-[10px] mt-0.5" style={{ color: "#94A3B8" }}>PNG & Excel</p>
+              </button>
+            </div>
+
+            <div className="bg-white rounded-xl shadow-sm overflow-hidden mb-3">
+              <div className="flex items-center justify-between px-3.5 pt-3 pb-2">
+                <div>
+                  <p className="maestro-section-title text-sm font-bold">Daftar Anggota</p>
+                  <p className="text-[10px] mt-0.5" style={{ color: "#94A3B8" }}>{group.members.length} anggota · {BULAN_FULL[selectedMonth]} {selectedYear}</p>
+                </div>
+                <button onClick={() => { setNewMemberName(""); document.getElementById("maestro-add-member")?.focus(); }} className="px-3 py-1.5 rounded-lg text-xs font-bold" style={{ background: "#EEF2FF", color: "#4F46E5" }}>＋ Anggota</button>
+              </div>
+              {memberRows.length === 0 ? (
+                <p className="text-sm text-center py-8" style={{ color: "#CBD5E1" }}>Belum ada anggota</p>
+              ) : (
+                <div className="px-1 pb-1">
+                  {memberRows.map((m, i) => (
+                    <div key={m.id} className="flex items-center justify-between px-2.5 py-2.5 border-t" style={{ borderColor: "#F1F5F9" }}>
+                      <button onClick={() => { setMemberModal(m.id); setUseCustom(false); setCustomAmount(""); }} className="flex-1 text-left">
+                        <div className="flex items-center gap-2">
+                          <span className="text-xs w-5" style={{ color: "#CBD5E1" }}>{i + 1}</span>
+                          <span className="text-sm font-semibold">{m.nama}</span>
+                        </div>
+                        <div className="flex items-center gap-2 mt-1 ml-7">
+                          <span className="text-[11px] font-semibold px-2 py-0.5 rounded-full" style={{ background: STATUS_STYLE[m.status].bg, color: STATUS_STYLE[m.status].fg }}>{STATUS_STYLE[m.status].label}</span>
+                          <span className="text-xs" style={{ color: "#64748B" }}>{m.status === "paid" ? formatRupiah(m.amount) : "-"}</span>
+                        </div>
+                      </button>
+                      <button onClick={() => removeMember(m.id, m.nama)} className="p-2 rounded-lg" style={{ background: "#F8FAFC" }} title="Hapus anggota">🗑️</button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            <div className="bg-white rounded-xl shadow-sm p-3 flex gap-2">
+              <input id="maestro-add-member" value={newMemberName} onChange={(e) => setNewMemberName(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && addMember()}
+                placeholder="Nama anggota baru" className="flex-1 text-sm outline-none px-1" />
+              <button onClick={addMember} className="px-4 py-2 rounded-lg text-sm font-bold" style={{ background: "#4F46E5", color: "white" }}>Tambah</button>
+            </div>
+          </>
+        )}
+
+        {tab === "expenses" && (
+          <>
+            <div className="bg-white rounded-xl shadow-sm p-3.5 mb-4">
+              <p className="text-xs font-semibold mb-2" style={{ color: "#94A3B8" }}>CATAT PENGELUARAN — {group.name}</p>
+              <input type="date" value={expDate} onChange={(e) => setExpDate(e.target.value)}
+                className="w-full border rounded-lg px-3 py-2 text-sm mb-2 outline-none" style={{ borderColor: "#E2E8F0" }} />
+              <input value={expDesc} onChange={(e) => setExpDesc(e.target.value)} placeholder="Jenis / keterangan pengeluaran"
+                className="w-full border rounded-lg px-3 py-2 text-sm mb-2 outline-none" style={{ borderColor: "#E2E8F0" }} />
+              <input value={expAmount} onChange={(e) => setExpAmount(e.target.value)} placeholder="Nominal" inputMode="numeric"
+                className="w-full border rounded-lg px-3 py-2 text-sm mb-2.5 outline-none" style={{ borderColor: "#E2E8F0" }} />
+              <button onClick={addExpense} className="w-full py-2.5 rounded-lg text-white text-sm font-semibold" style={{ background: "#F43F5E" }}>
+                Catat Pengeluaran
+              </button>
+            </div>
+            <div className="bg-white rounded-xl shadow-sm p-3.5 mb-4">
+              <p className="text-xs font-semibold mb-3" style={{ color: "#94A3B8" }}>RINGKASAN PENGELUARAN — {group.name}</p>
+              <div className="grid grid-cols-2 gap-2.5">
+                <div className="rounded-lg p-3" style={{ background: "#FEF2F2" }}>
+                  <p className="text-xs font-semibold uppercase mb-1" style={{ color: "#B91C1C" }}>Akumulasi Pengeluaran</p>
+                  <p className="text-lg font-extrabold" style={{ color: "#DC2626", fontFamily: "'Plus Jakarta Sans',sans-serif" }}>{formatRupiah(allTimeExpenses)}</p>
+                </div>
+                <div className="rounded-lg p-3" style={{ background: "#EEF2FF" }}>
+                  <p className="text-xs font-semibold uppercase mb-1" style={{ color: "#4F46E5" }}>Sisa Saldo</p>
+                  <p className="text-lg font-extrabold" style={{ color: "#4F46E5", fontFamily: "'Plus Jakarta Sans',sans-serif" }}>{formatRupiah(cashBalance)}</p>
+                </div>
+              </div>
+              <p className="text-xs mt-2.5" style={{ color: "#CBD5E1" }}>Sisa saldo = total uang terkumpul (semua pemasukan) dikurangi total pengeluaran, sepanjang waktu.</p>
+              <button onClick={handleDownloadExpensePNG}
+                className="w-full flex items-center justify-center gap-1.5 py-2.5 rounded-xl text-sm font-semibold mt-3" style={{ background: "#FEF2F2", color: "#DC2626" }}>
+                ⬇️ Download PNG Pengeluaran (semua data)
+              </button>
+            </div>
+
+            <ExportLinksPanel exportLinks={exportLinks} setExportLinks={setExportLinks} />
+
+            <div className="bg-white rounded-xl shadow-sm overflow-hidden">
+              <p className="text-xs font-semibold px-3.5 pt-3" style={{ color: "#94A3B8" }}>RIWAYAT PENGELUARAN — DETAIL</p>
+              {group.expenses.length === 0 ? (
+                <p className="text-sm text-center py-8" style={{ color: "#CBD5E1" }}>Belum ada pengeluaran</p>
+              ) : (
+                <div className="px-1 pb-1 mt-1">
+                  {[...group.expenses].sort((a, b) => new Date(b.date) - new Date(a.date)).map((e) => (
+                    <div key={e.id} className="flex items-center justify-between px-2.5 py-2.5 border-b last:border-0" style={{ borderColor: "#F1F5F9" }}>
+                      <div>
+                        <p className="text-sm font-medium">{e.description}</p>
+                        <p className="text-xs" style={{ color: "#94A3B8" }}>{formatDateID(e.date)}</p>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <span className="text-sm font-semibold" style={{ color: "#DC2626" }}>{formatRupiah(e.amount)}</span>
+                        <button onClick={() => removeExpense(e.id, e.description)}>🗑️</button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </>
+        )}
+
+        {tab === "reports" && (
+          <div className="flex flex-col gap-3">
+            <div className="bg-white rounded-xl shadow-sm p-3.5">
+              <div className="flex items-center justify-between mb-2">
+                <div>
+                  <p className="text-sm font-bold">📸 PNG Bulan Ini</p>
+                  <p className="text-xs mt-0.5" style={{ color: "#94A3B8" }}>{group.name} · {BULAN_FULL[selectedMonth]} {selectedYear}</p>
+                </div>
+                <button onClick={handleDownloadPNG} className="px-3 py-2 rounded-lg text-xs font-bold" style={{ background: "#EEF2FF", color: "#4F46E5" }}>Buat PNG</button>
+              </div>
+            </div>
+
+            <div className="bg-white rounded-xl shadow-sm p-3.5">
+              <div className="flex items-center justify-between mb-2">
+                <div>
+                  <p className="text-sm font-bold">📸 PNG Rekap Tahunan</p>
+                  <p className="text-xs mt-0.5" style={{ color: "#94A3B8" }}>{group.name} · Januari–Desember {selectedYear}</p>
+                </div>
+                <button onClick={handleDownloadYearlyPNG} className="px-3 py-2 rounded-lg text-xs font-bold" style={{ background: "#F0FDF4", color: "#16A34A" }}>Buat PNG</button>
+              </div>
+            </div>
+
+            <div className="bg-white rounded-xl shadow-sm p-3.5">
+              <p className="text-sm font-bold mb-1">📗 Excel Rekap Tahunan</p>
+              <p className="text-xs mb-3" style={{ color: "#94A3B8" }}>{selectedYear} · File terpisah per group</p>
+              <div className="grid grid-cols-2 gap-2">
+                {['A','B'].map((gk) => (
+                  <button key={gk} onClick={() => handleExportExcel(gk)} className="py-2.5 rounded-xl text-xs font-bold border" style={{ borderColor: "#BAE6FD", background: "#F0F9FF", color: "#0369A1" }}>
+                    Unduh {data.groups[gk].name}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <ExportLinksPanel exportLinks={exportLinks} setExportLinks={setExportLinks} />
+          </div>
+        )}
+
+        {tab === "settings" && (
+          <div className="flex flex-col gap-3">
+            <div className="bg-white rounded-xl shadow-sm p-3.5">
+              <p className="text-xs font-semibold mb-2" style={{ color: "#94A3B8" }}>APLIKASI</p>
+              <label className="text-xs" style={{ color: "#94A3B8" }}>Nama Aplikasi</label>
+              <input value={data.appName} onChange={(e) => setData((d) => ({ ...d, appName: e.target.value }))}
+                className="w-full border rounded-lg px-3 py-2 text-sm mb-2.5 mt-1 outline-none" style={{ borderColor: "#E2E8F0" }} />
+              <label className="text-xs" style={{ color: "#94A3B8" }}>Tagline</label>
+              <input value={data.appTagline} onChange={(e) => setData((d) => ({ ...d, appTagline: e.target.value }))}
+                className="w-full border rounded-lg px-3 py-2 text-sm mt-1 outline-none" style={{ borderColor: "#E2E8F0" }} />
+            </div>
+
+            <div className="bg-white rounded-xl shadow-sm p-3.5">
+              <p className="text-xs font-semibold mb-2" style={{ color: "#94A3B8" }}>PENGATURAN {group.name.toUpperCase()}</p>
+              <label className="text-xs" style={{ color: "#94A3B8" }}>Nama Grup</label>
+              <input value={group.name} onChange={(e) => updateGroup(() => ({ name: e.target.value }))}
+                className="w-full border rounded-lg px-3 py-2 text-sm mb-2.5 mt-1 outline-none" style={{ borderColor: "#E2E8F0" }} />
+              <label className="text-xs" style={{ color: "#94A3B8" }}>Nominal Iuran Default</label>
+              <input value={group.defaultAmount} onChange={(e) => {
+                  const v = parseFloat(e.target.value.replace(/[^0-9.-]/g, "")) || 0;
+                  const old = group.defaultAmount;
+                  updateGroup(() => ({ defaultAmount: v }));
+                  if (v !== old) logActivity(`Nominal iuran ${group.name} diubah dari ${formatRupiah(old)} ke ${formatRupiah(v)}`);
+                }}
+                className="w-full border rounded-lg px-3 py-2 text-sm mb-2.5 mt-1 outline-none" style={{ borderColor: "#E2E8F0" }} />
+              <label className="text-xs" style={{ color: "#94A3B8" }}>Saldo Awal</label>
+              <input value={group.openingBalance} onChange={(e) => updateGroup(() => ({ openingBalance: parseFloat(e.target.value.replace(/[^0-9.-]/g, "")) || 0 }))}
+                className="w-full border rounded-lg px-3 py-2 text-sm mb-2.5 mt-1 outline-none" style={{ borderColor: "#E2E8F0" }} />
+              <label className="text-xs" style={{ color: "#94A3B8" }}>Keterangan Saldo Awal (opsional)</label>
+              <input value={group.openingBalanceNote || ""} onChange={(e) => updateGroup(() => ({ openingBalanceNote: e.target.value }))}
+                placeholder='misal: "Saldo sisa tahun 2025"'
+                className="w-full border rounded-lg px-3 py-2 text-sm mt-1 outline-none" style={{ borderColor: "#E2E8F0" }} />
+            </div>
+
+            <div className="bg-white rounded-xl shadow-sm p-3.5">
+              <p className="text-xs font-semibold mb-2" style={{ color: "#94A3B8" }}>PENYIMPANAN CLOUD (SUPABASE)</p>
+              <p className="text-xs mb-2" style={{ color: "#64748B" }}>
+                Status: <span style={{ fontWeight: 600, color: syncStatus === "error" ? "#DC2626" : syncStatus === "offline" ? "#B45309" : "#16A34A" }}>
+                  {syncStatus === "offline" ? "Offline (data aman di HP)" : syncStatus === "error" ? "Gagal sinkron" : syncStatus === "saving" ? "Menyimpan…" : "Tersambung"}
+                </span>
+              </p>
+              <p className="text-xs mb-3 break-all" style={{ color: "#94A3B8" }}>{supaConfig ? supaConfig.url : "-"}</p>
+              <button onClick={() => {
+                  if (confirm("Putuskan koneksi Supabase di device ini? Kamu perlu masukkan URL & key lagi untuk lanjut pakai aplikasi.")) {
+                    localStorage.removeItem(SUPABASE_CONFIG_KEY);
+                    setSupaConfig(null);
+                  }
+                }}
+                className="w-full py-2.5 rounded-lg text-sm font-semibold" style={{ background: "#FEF2F2", color: "#DC2626" }}>
+                Putuskan / Ganti Koneksi Supabase
+              </button>
+            </div>
+
+            <div className="bg-white rounded-xl shadow-sm p-3.5">
+              <p className="text-xs font-semibold mb-2" style={{ color: "#94A3B8" }}>AKUN LOGIN</p>
+              <label className="text-xs" style={{ color: "#94A3B8" }}>Username</label>
+              <input value={data.auth.username} onChange={(e) => setData((d) => ({ ...d, auth: { ...d.auth, username: e.target.value } }))}
+                className="w-full border rounded-lg px-3 py-2 text-sm mb-2.5 mt-1 outline-none" style={{ borderColor: "#E2E8F0" }} />
+              <label className="text-xs" style={{ color: "#94A3B8" }}>Password</label>
+              <input value={data.auth.password} onChange={(e) => setData((d) => ({ ...d, auth: { ...d.auth, password: e.target.value } }))}
+                className="w-full border rounded-lg px-3 py-2 text-sm mt-1 outline-none" style={{ borderColor: "#E2E8F0" }} />
+              <p className="text-xs mt-2" style={{ color: "#CBD5E1" }}>Login ini disimpan di penyimpanan browser HP kamu (localStorage), bukan sistem autentikasi server sungguhan. Kalau cache browser di-clear, username/password ini ikut ke-reset ke admin/admin123.</p>
+            </div>
+
+          </div>
+        )}
+
+        {syncStatus === "saving" && <p className="text-xs mt-3 text-center" style={{ color: "#94A3B8" }}>Menyimpan ke cloud…</p>}
+        {syncStatus === "error" && <p className="text-xs mt-3 text-center" style={{ color: "#DC2626" }}>Gagal sinkron ke Supabase. Data tetap tersimpan di HP ini, akan dicoba lagi otomatis.</p>}
+        {syncStatus === "offline" && <p className="text-xs mt-3 text-center" style={{ color: "#B45309" }}>Tidak ada koneksi internet. Semua perubahan tetap tersimpan di HP ini dan akan otomatis naik ke cloud begitu online lagi.</p>}
+      </div>
+
+      {/* Bottom nav */}
+      <div className="maestro-bottom-nav fixed bottom-0 left-0 right-0 bg-white border-t flex z-40" style={{ borderColor: "#E2E8F0" }}>
+        {[
+          ["dashboard", "🏠", "Beranda"],
+          ["expenses", "💸", "Pengeluaran"],
+          ["reports", "📊", "Rekap"],
+          ["settings", "⚙️", "Pengaturan"],
+        ].map(([key, emoji, label]) => (
+          <button key={key} onClick={() => setTab(key)} className="flex-1 flex flex-col items-center py-2.5 gap-0.5">
+            <span style={{ fontSize: 18, opacity: tab === key ? 1 : 0.55 }}>{emoji}</span>
+            <span className="text-[11px] font-semibold" style={{ color: tab === key ? "#4F46E5" : "#94A3B8" }}>{label}</span>
+          </button>
+        ))}
+      </div>
+
+      {/* Member action modal */}
+      {modalMember && (
+        <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center" style={{ background: "rgba(15,23,42,0.45)" }} onClick={() => setMemberModal(null)}>
+          <div className="bg-white rounded-t-2xl sm:rounded-2xl w-full sm:max-w-sm p-5" onClick={(e) => e.stopPropagation()}>
+            <div className="flex items-center justify-between mb-1">
+              <h3 className="text-base font-bold" style={{ fontFamily: "'Plus Jakarta Sans',sans-serif" }}>{modalMember.nama}</h3>
+              <button onClick={() => setMemberModal(null)}>✕</button>
+            </div>
+            <p className="text-xs mb-3" style={{ color: "#94A3B8" }}>{BULAN_FULL[selectedMonth]} {selectedYear} · {group.name}</p>
+
+            {modalMember.status !== "unpaid" && (
+              <div className="rounded-xl p-3 mb-3 flex items-center justify-between" style={{ background: STATUS_STYLE[modalMember.status].bg }}>
+                <div>
+                  <p className="text-xs font-semibold" style={{ color: STATUS_STYLE[modalMember.status].fg }}>
+                    Status saat ini: {STATUS_STYLE[modalMember.status].label}
+                  </p>
+                  {modalMember.status === "paid" && (
+                    <p className="text-xs mt-0.5" style={{ color: STATUS_STYLE[modalMember.status].fg }}>
+                      {formatRupiah(modalMember.amount)}
+                    </p>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {modalMember.status === "unpaid" ? (
+              <>
+                <button onClick={() => markPaid(modalMember.id, modalMember.nama, group.defaultAmount)}
+                  className="w-full py-3 rounded-xl text-sm font-semibold mb-2 text-white" style={{ background: "#16A34A" }}>
+                  ✓ Tandai Lunas — {formatRupiah(group.defaultAmount)}
+                </button>
+
+                {!useCustom ? (
+                  <button onClick={() => setUseCustom(true)} className="w-full py-2.5 rounded-xl text-sm font-medium mb-2 border" style={{ borderColor: "#E2E8F0", color: "#4F46E5" }}>
+                    Gunakan Nominal Custom
+                  </button>
+                ) : (
+                  <div className="flex gap-2 mb-2">
+                    <input value={customAmount} onChange={(e) => setCustomAmount(e.target.value)} placeholder="Nominal custom" inputMode="numeric"
+                      className="flex-1 border rounded-xl px-3 py-2.5 text-sm outline-none" style={{ borderColor: "#E2E8F0" }} />
+                    <button onClick={() => {
+                        const n = parseFloat(String(customAmount).replace(/[^0-9.-]/g, ""));
+                        if (n > 0) markPaid(modalMember.id, modalMember.nama, n);
+                      }}
+                      className="px-4 rounded-xl text-white text-sm font-semibold" style={{ background: "#4F46E5" }}>
+                      Simpan
+                    </button>
+                  </div>
+                )}
+
+                <button onClick={() => markLeave(modalMember.id, modalMember.nama)}
+                  className="w-full py-2.5 rounded-xl text-sm font-semibold" style={{ background: "#FEF3C7", color: "#B45309" }}>
+                  Tandai Vacation
+                </button>
+              </>
+            ) : (
+              <>
+                <button onClick={() => markUnpaid(modalMember.id, modalMember.nama)}
+                  className="w-full py-3 rounded-xl text-sm font-semibold mb-2 text-white" style={{ background: "#DC2626" }}>
+                  ↺ Batalkan — jadi Belum Bayar
+                </button>
+                <p className="text-xs text-center mb-2" style={{ color: "#CBD5E1" }}>Salah pencet? Klik tombol di atas untuk membatalkan, lalu tandai ulang dengan benar.</p>
+
+                {modalMember.status === "leave" && (
+                  <button onClick={() => markPaid(modalMember.id, modalMember.nama, group.defaultAmount)}
+                    className="w-full py-2.5 rounded-xl text-sm font-semibold" style={{ background: "#DCFCE7", color: "#15803D" }}>
+                    Ubah jadi Lunas — {formatRupiah(group.defaultAmount)}
+                  </button>
+                )}
+                {modalMember.status === "paid" && (
+                  <button onClick={() => markLeave(modalMember.id, modalMember.nama)}
+                    className="w-full py-2.5 rounded-xl text-sm font-semibold" style={{ background: "#FEF3C7", color: "#B45309" }}>
+                    Ubah jadi Vacation
+                  </button>
+                )}
+              </>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ExportLinksPanel({ exportLinks, setExportLinks }) {
+  const [previewFile, setPreviewFile] = useState(null);
+  if (exportLinks.length === 0) return null;
+  return (
+    <div className="bg-white rounded-xl shadow-sm p-3 mb-5">
+      <p className="text-xs font-semibold mb-2" style={{ color: "#94A3B8" }}>FILE SIAP DISIMPAN</p>
+      <div className="flex flex-col gap-2">
+        {exportLinks.map((f) => (
+          <div key={f.id} className="flex items-center gap-2.5 border rounded-lg p-2" style={{ borderColor: "#E2E8F0" }}>
+            {f.kind === "png" ? (
+              <img src={f.url} alt={f.filename} onClick={() => setPreviewFile(f)}
+                className="w-12 h-16 object-cover rounded cursor-pointer"
+                style={{ border: "1px solid #E2E8F0", WebkitTouchCallout: "none", userSelect: "none" }}
+                draggable="false" />
+            ) : (
+              <div className="w-10 h-10 rounded flex items-center justify-center" style={{ background: "#EEF2FF" }}>
+                ⬇️
+              </div>
+            )}
+            <div className="flex-1 min-w-0">
+              <p className="text-xs font-medium truncate">{f.filename}</p>
+              {f.kind === "png" && <p className="text-xs" style={{ color: "#CBD5E1" }}>Tap gambar untuk lihat preview</p>}
+            </div>
+            <button onClick={() => saveFile(f.url, f.filename)}
+              className="px-3 py-1.5 rounded-lg text-xs font-semibold text-white shrink-0" style={{ background: "#4F46E5" }}>
+              Simpan
+            </button>
+          </div>
+        ))}
+        <button onClick={() => setExportLinks([])} className="text-xs mt-1 self-start" style={{ color: "#94A3B8" }}>
+          Bersihkan daftar
+        </button>
+      </div>
+
+      {previewFile && (
+        <div className="fixed inset-0 z-50 flex flex-col" style={{ background: "rgba(15,23,42,0.9)" }}
+          onClick={() => setPreviewFile(null)}>
+          <div className="flex items-center justify-between p-4">
+            <p className="text-xs font-medium truncate pr-2" style={{ color: "white" }}>{previewFile.filename}</p>
+            <button onClick={() => setPreviewFile(null)}
+              className="w-8 h-8 rounded-full flex items-center justify-center shrink-0"
+              style={{ background: "rgba(255,255,255,0.15)", color: "white" }}>✕</button>
+          </div>
+          <div className="flex-1 flex items-center justify-center overflow-auto px-4" onClick={(e) => e.stopPropagation()}>
+            <img src={previewFile.url} alt={previewFile.filename} className="max-w-full max-h-full rounded-lg shadow-2xl"
+              style={{ WebkitTouchCallout: "none" }} draggable="false" />
+          </div>
+          <div className="p-4" onClick={(e) => e.stopPropagation()}>
+            <button onClick={() => saveFile(previewFile.url, previewFile.filename)}
+              className="w-full py-3 rounded-xl text-sm font-bold text-white" style={{ background: "#4F46E5" }}>
+              Simpan ke Galeri
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function StatusMini({ label, value, bg, fg }) {
+  return (
+    <div className="rounded-xl p-2.5 text-center" style={{ background: bg }}>
+      <p className="text-[10px] font-semibold" style={{ color: fg }}>{label}</p>
+      <p className="text-lg font-extrabold mt-0.5" style={{ color: fg, fontFamily: "'Plus Jakarta Sans',sans-serif" }}>{value}</p>
+    </div>
+  );
+}
+
+function BigCard({ icon, label, value, bg, full }) {
+  return (
+    <div className={`rounded-xl p-3.5 ${full ? "col-span-2" : ""}`} style={{ background: bg }}>
+      <div className="flex items-center gap-1.5 mb-1.5 opacity-90">
+        {icon}
+        <span className="text-xs font-semibold text-white uppercase tracking-wide">{label}</span>
+      </div>
+      <p className="text-lg font-extrabold text-white" style={{ fontFamily: "'Plus Jakarta Sans',sans-serif" }}>{value}</p>
+    </div>
+  );
+}
+
+function SummaryCard({ label, value, color }) {
+  return (
+    <div className="bg-white rounded-lg p-2.5 shadow-sm">
+      <p className="text-xs font-semibold uppercase" style={{ color: "#94A3B8" }}>{label}</p>
+      <p className="text-sm font-bold" style={{ color }}>{value}</p>
+    </div>
+  );
+}
+
+function ReportRow({ label, value, color, bold }) {
+  return (
+    <div className="flex justify-between items-center py-1.5">
+      <span className="text-sm" style={{ color: "#64748B" }}>{label}</span>
+      <span className={bold ? "text-base font-bold" : "text-sm font-semibold"} style={{ color }}>{value}</span>
+    </div>
+  );
+}
+
+function MemberLine({ idx, m }) {
+  const st = STATUS_STYLE[m.status];
+  return (
+    <div className="flex items-center justify-between py-1.5 border-b last:border-0" style={{ borderColor: "#F8FAFC" }}>
+      <span className="text-xs flex-1"><span style={{ color: "#CBD5E1" }}>{idx}.</span> {m.nama}</span>
+      <span className="text-xs font-semibold px-2 py-0.5 rounded-full mr-2" style={{ background: st.bg, color: st.fg }}>{st.label}</span>
+      <span className="text-xs w-20 text-right" style={{ color: "#64748B" }}>{m.status === "paid" ? formatRupiah(m.amount) : "-"}</span>
+    </div>
+  );
+}
+
+
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(<Maestro />);
+</script>
+
+<script>
+  // Daftarkan service worker supaya app shell (HTML/JS/CSS/font) tersimpan di HP
+  // dan aplikasi tetap bisa dibuka walau tidak ada internet.
+  if ("serviceWorker" in navigator) {
+    window.addEventListener("load", () => {
+      navigator.serviceWorker.register("service-worker.js").catch(() => { /* ignore */ });
+    });
+  }
+</script>
+</body>
+</html>
