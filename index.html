@@ -511,8 +511,12 @@ function Maestro() {
     };
   }
 
+  // Grup yang aktif = yang benar-benar ada di data. Default cuma A & B; grup C dsb
+  // hanya muncul kalau memang sudah dibuat lewat menu Pengaturan.
+  const groupKeys = useMemo(() => ["A", "B", "C", "D"].filter((k) => data.groups[k]), [data.groups]);
+
   const groupComparison = useMemo(() => {
-    return ["A", "B"].map((gk) => {
+    return groupKeys.map((gk) => {
       const g = data.groups[gk];
       const income = Object.values(g.payments).filter((p) => p.status === "paid").reduce((s, p) => s + p.amount, 0);
       const expense = g.expenses.reduce((s, e) => s + e.amount, 0);
@@ -522,7 +526,7 @@ function Maestro() {
         openingBalance: g.openingBalance, openingBalanceNote: g.openingBalanceNote,
       };
     });
-  }, [data.groups]);
+  }, [data.groups, groupKeys]);
 
   // ---- Excel export: one separate, polished workbook per group, full selected year ----
   const handleExportExcel = (groupKey = selectedGroup) => {
@@ -1297,7 +1301,7 @@ function Maestro() {
         </div>
         <div className="mb-2">
           <div className="flex gap-2">
-            {["A", "B"].map((g) => (
+            {groupKeys.map((g) => (
               <button key={g} onClick={() => setSelectedGroup(g)}
                 className="flex-1 py-2.5 rounded-xl text-sm font-bold transition-colors"
                 style={{ background: selectedGroup === g ? "white" : "rgba(255,255,255,0.15)", color: selectedGroup === g ? "#4F46E5" : "white" }}>
@@ -1515,7 +1519,7 @@ function Maestro() {
               <p className="text-sm font-bold mb-1">📗 Excel Rekap Tahunan</p>
               <p className="text-xs mb-3" style={{ color: "#94A3B8" }}>{selectedYear} · File terpisah per group</p>
               <div className="grid grid-cols-2 gap-2">
-                {['A','B'].map((gk) => (
+                {groupKeys.map((gk) => (
                   <button key={gk} onClick={() => handleExportExcel(gk)} className="py-2.5 rounded-xl text-xs font-bold border" style={{ borderColor: "#BAE6FD", background: "#F0F9FF", color: "#0369A1" }}>
                     Unduh {data.groups[gk].name}
                   </button>
@@ -1559,6 +1563,46 @@ function Maestro() {
               <input value={group.openingBalanceNote || ""} onChange={(e) => updateGroup(() => ({ openingBalanceNote: e.target.value }))}
                 placeholder='misal: "Saldo sisa tahun 2025"'
                 className="w-full border rounded-lg px-3 py-2 text-sm mt-1 outline-none" style={{ borderColor: "#E2E8F0" }} />
+            </div>
+
+            <div className="bg-white rounded-xl shadow-sm p-3.5">
+              <p className="text-xs font-semibold mb-2" style={{ color: "#94A3B8" }}>KELOLA GRUP</p>
+              <p className="text-xs mb-3" style={{ color: "#94A3B8" }}>
+                Grup tambahan bersifat opsional — kalau tidak dibuat, tampilan tetap 2 kolom seperti biasa.
+              </p>
+              <div className="flex flex-col gap-2 mb-3">
+                {groupKeys.map((gk) => (
+                  <div key={gk} className="flex items-center justify-between border rounded-lg px-3 py-2" style={{ borderColor: "#E2E8F0" }}>
+                    <span className="text-sm font-medium">{data.groups[gk].name}</span>
+                    {gk !== "A" && gk !== "B" && (
+                      <button onClick={() => {
+                          if (!confirm(`Hapus grup "${data.groups[gk].name}"? Semua data anggota, pembayaran, dan pengeluaran di grup ini akan hilang permanen. Grup PPT/PIRATES tidak akan terpengaruh.`)) return;
+                          setData((d) => {
+                            const groups = { ...d.groups };
+                            delete groups[gk];
+                            return { ...d, groups };
+                          });
+                          if (selectedGroup === gk) setSelectedGroup("A");
+                        }}
+                        className="text-xs font-semibold px-2.5 py-1 rounded-lg" style={{ background: "#FEF2F2", color: "#DC2626" }}>
+                        Hapus
+                      </button>
+                    )}
+                  </div>
+                ))}
+              </div>
+              {groupKeys.length < 4 ? (
+                <button onClick={() => {
+                    const nextKey = ["C", "D"].find((k) => !data.groups[k]);
+                    setData((d) => ({ ...d, groups: { ...d.groups, [nextKey]: defaultGroup(`Group ${nextKey}`, 50000) } }));
+                    setSelectedGroup(nextKey);
+                  }}
+                  className="w-full py-2.5 rounded-lg text-sm font-semibold" style={{ background: "#EEF2FF", color: "#4F46E5" }}>
+                  + Tambah Grup
+                </button>
+              ) : (
+                <p className="text-xs text-center" style={{ color: "#CBD5E1" }}>Maksimal 4 grup.</p>
+              )}
             </div>
 
             <div className="bg-white rounded-xl shadow-sm p-3.5">
