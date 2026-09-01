@@ -5,7 +5,7 @@
 // - Supabase API calls: never touched by the SW (network only), so the app's own
 //   online/offline + localStorage fallback logic keeps working exactly as designed.
 
-const CACHE_VERSION = "maestro-v3";
+const CACHE_VERSION = "maestro-v7";
 const CACHE_NAME = `maestro-cache-${CACHE_VERSION}`;
 
 const APP_SHELL = [
